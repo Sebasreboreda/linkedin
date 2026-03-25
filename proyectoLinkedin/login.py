@@ -2,7 +2,6 @@ import os
 
 from playwright.sync_api import sync_playwright
 
-
 def load_env_file(path: str = ".env") -> None:
     if not os.path.exists(path):
         return
@@ -32,34 +31,9 @@ if not linkedin_email or not linkedin_password:
         "LINKEDIN_PASSWORD=..."
     )
 
-email_selectors = [
-    'input#username',
-    'input[name="session_key"]',
-    'input[name="email"]',
-    'input[type="email"]',
-]
-
-password_selectors = [
-    'input#password',
-    'input[name="session_password"]',
-    'input[name="password"]',
-    'input[type="password"]',
-]
-
-submit_selectors = [
-    'button[type="submit"]',
-    'button:has-text("Sign in")',
-    'button:has-text("Iniciar sesión")',
-    'button:has-text("Iniciar sesion")',
-]
-
-continue_selectors = [
-    'button:has-text("Continue")',
-    'button:has-text("Continuar")',
-    'button:has-text("Next")',
-    'button:has-text("Siguiente")',
-]
-
+email_selector = 'input[name="session_key"]',
+password_selector = 'input#password',
+submit_selector = 'button[type="submit"]',
 
 with sync_playwright() as p:
     browser = p.chromium.launch(headless=False)
@@ -71,7 +45,7 @@ with sync_playwright() as p:
 
     # Intentamos rellenar el correo y la contraseña si el formulario aparece.
     filled_email = False
-    for sel in email_selectors:
+    for sel in email_selector:
         loc = page.locator(sel).first
         try:
             if loc.count() > 0 and loc.is_visible():
@@ -82,7 +56,7 @@ with sync_playwright() as p:
             continue
 
     filled_password = False
-    for sel in password_selectors:
+    for sel in password_selector:
         loc = page.locator(sel).first
         try:
             if loc.count() > 0 and loc.is_visible():
@@ -92,31 +66,9 @@ with sync_playwright() as p:
         except Exception:
             continue
 
-    # Si LinkedIn muestra un paso previo (solo email) intentamos avanzar y luego rellenar password.
-    if filled_email and not filled_password:
-        for sel in continue_selectors:
-            loc = page.locator(sel).first
-            try:
-                if loc.count() > 0 and loc.is_visible():
-                    loc.click()
-                    page.wait_for_timeout(1500)
-                    break
-            except Exception:
-                continue
-
-        for sel in password_selectors:
-            loc = page.locator(sel).first
-            try:
-                if loc.count() > 0 and loc.is_visible():
-                    loc.fill(linkedin_password)
-                    filled_password = True
-                    break
-            except Exception:
-                continue
-
     # En cuanto el formulario esté rellenado, intentamos enviar el login.
     if filled_email and filled_password:
-        for sel in submit_selectors:
+        for sel in submit_selector:
             loc = page.locator(sel).first
             try:
                 if loc.count() > 0 and loc.is_visible():
