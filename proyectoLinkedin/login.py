@@ -19,7 +19,12 @@ def load_env_file(path: str = ".env") -> None:
             os.environ.setdefault(key, value)
 
 
-load_env_file()
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(SCRIPT_DIR)
+
+# Cargamos variables desde ambas ubicaciones habituales.
+load_env_file(os.path.join(SCRIPT_DIR, ".env"))
+load_env_file(os.path.join(ROOT_DIR, ".env"))
 
 linkedin_email = os.getenv("LINKEDIN_EMAIL")
 linkedin_password = os.getenv("LINKEDIN_PASSWORD")
@@ -31,9 +36,20 @@ if not linkedin_email or not linkedin_password:
         "LINKEDIN_PASSWORD=..."
     )
 
-email_selector = 'input[name="session_key"]',
-password_selector = 'input#password',
-submit_selector = 'button[type="submit"]',
+email_selectors = [
+    'input[name="session_key"]',
+    'input#username',
+    'input[name="username"]',
+]
+password_selectors = [
+    "input#password",
+    'input[name="session_password"]',
+    'input[name="password"]',
+]
+submit_selectors = [
+    'button[type="submit"]',
+    'button[data-id="sign-in-form__submit-btn"]',
+]
 
 with sync_playwright() as p:
     browser = p.chromium.launch(headless=False)
@@ -43,44 +59,56 @@ with sync_playwright() as p:
     page.goto("https://www.linkedin.com/login")
     page.wait_for_load_state("domcontentloaded")
 
-    # Intentamos rellenar el correo y la contraseña si el formulario aparece.
-    filled_email = False
-    for sel in email_selector:
+    # Intentamos rellenar el correo y la contraseña con varios selectores
+    # porque LinkedIn cambia el formulario con frecuencia.
+    email_input = None
+    for sel in email_selectors:
         loc = page.locator(sel).first
-        try:
-            if loc.count() > 0 and loc.is_visible():
-                loc.fill(linkedin_email)
-                filled_email = True
-                break
-        except Exception:
-            continue
+        if loc.count() > 0:
+            email_input = loc
+            break
 
-    filled_password = False
-    for sel in password_selector:
+    password_input = None
+    for sel in password_selectors:
         loc = page.locator(sel).first
-        try:
-            if loc.count() > 0 and loc.is_visible():
-                loc.fill(linkedin_password)
-                filled_password = True
-                break
-        except Exception:
-            continue
+        if loc.count() > 0:
+            password_input = loc
+            break
 
-    # En cuanto el formulario esté rellenado, intentamos enviar el login.
-    if filled_email and filled_password:
-        for sel in submit_selector:
-            loc = page.locator(sel).first
-            try:
-                if loc.count() > 0 and loc.is_visible():
-                    loc.click()
-                    break
-            except Exception:
-                continue
-        print("Credenciales insertadas. Completa MFA u otros pasos y pulsa ENTER.")
+    if email_input and password_input:
+        email_input.fill(linkedin_email)
+        password_input.fill(linkedin_password)
+
+        clicked = False
+        for sel in submit_selectors:
+            btn = page.locator(sel).first
+            if btn.count() > 0:
+                btn.click()
+                clicked = True
+                break
+
+        if not clicked:
+            password_input.press("Enter")
+
+        # LinkedIn suele mantener requests en segundo plano y "networkidle"
+        # puede agotar el timeout aunque la pagina este lista.
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=15000)
+        except Exception:
+            pass
+        print("Credenciales insertadas. Si LinkedIn pide MFA/captcha, complétalo y pulsa ENTER.")
     else:
         print("No se encontraron campos de login o LinkedIn usó un flujo diferente.")
         print("Inicia sesión manualmente en la ventana del navegador y pulsa ENTER.")
 
-    input("Pulsa ENTER para guardar `state.json`...")
-    context.storage_state(path="state.json")
+    input("Pulsa ENTER cuando ya veas tu inicio de sesion completado...")
+    page.goto("https://www.linkedin.com/feed/")
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=15000)
+    except Exception:
+        pass
+
+    state_path = os.path.join(SCRIPT_DIR, "state.json")
+    context.storage_state(path=state_path)
+    print(f"Sesion guardada en: {state_path}")
     browser.close()
