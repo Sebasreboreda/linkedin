@@ -3,7 +3,6 @@ CREATE TABLE perfiles (
     nombre_usuario TEXT NOT NULL UNIQUE
 );
 
-
 CREATE TABLE metricas_perfil (
     id BIGSERIAL PRIMARY KEY,
     perfil_id BIGINT NOT NULL REFERENCES perfiles(id) ON DELETE CASCADE,
@@ -12,21 +11,14 @@ CREATE TABLE metricas_perfil (
     seguidores INTEGER NOT NULL
 );
 
-
 CREATE TABLE publicaciones (
     id BIGSERIAL PRIMARY KEY,
     perfil_id BIGINT NOT NULL REFERENCES perfiles(id) ON DELETE CASCADE,
     id_publicacion TEXT NOT NULL,
-    UNIQUE (perfil_id, id_publicacion)
-);
-
-
-CREATE TABLE metricas_publicacion (
-    id BIGSERIAL PRIMARY KEY,
-    publicacion_id BIGINT NOT NULL REFERENCES publicaciones(id) ON DELETE CASCADE,
-    fecha_captura TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    fecha_publicacion TIMESTAMPTZ NOT NULL,
     reacciones INTEGER NOT NULL,
     comentarios INTEGER NOT NULL,
     compartidos INTEGER NOT NULL,
-    envios INTEGER NOT NULL
+    envios INTEGER NOT NULL,
+    UNIQUE (perfil_id, id_publicacion)
 );
