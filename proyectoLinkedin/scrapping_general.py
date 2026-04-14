@@ -2,11 +2,16 @@ import os
 import re
 import time
 import json
+import hashlib
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote_plus
 
 from playwright.sync_api import sync_playwright
+try:
+    import psycopg
+except ImportError:
+    psycopg = None
 
 
 def delay(seconds: float = 2.0) -> None:
@@ -100,6 +105,145 @@ def extraer_fecha(texto: str) -> str:
     if fecha_match:
         return fecha_match.group(1)
     return "Fecha no encontrada"
+
+
+def convertir_a_entero(valor: str) -> int:
+    if valor is None:
+        return 0
+    texto = normalizar_numero(str(valor)).lower()
+    texto = texto.replace("seguidores", "").replace("followers", "").strip()
+    texto = texto.replace(" ", "")
+
+    m_sufijo = re.search(r"(\d+(?:[.,]\d+)?)\s*([km])$", texto)
+    if m_sufijo:
+        base = float(m_sufijo.group(1).replace(",", "."))
+        mult = 1_000 if m_sufijo.group(2) == "k" else 1_000_000
+        return int(base * mult)
+
+    m_mil = re.search(r"(\d+(?:[.,]\d+)?)\s*mil$", texto)
+    if m_mil:
+        base = float(m_mil.group(1).replace(",", "."))
+        return int(base * 1_000)
+
+    solo_digitos = re.sub(r"[^\d]", "", texto)
+    return int(solo_digitos) if solo_digitos else 0
+
+
+def convertir_fecha_publicacion(valor: str) -> datetime:
+    if not valor:
+        return datetime.now(timezone.utc)
+
+    texto = normalizar_texto(valor)
+    ahora = datetime.now(timezone.utc)
+
+    m_fecha = re.search(r"(\d{1,2})/(\d{1,2})/(\d{2,4})", texto)
+    if m_fecha:
+        dia = int(m_fecha.group(1))
+        mes = int(m_fecha.group(2))
+        anio = int(m_fecha.group(3))
+        if anio < 100:
+            anio += 2000
+        try:
+            return datetime(anio, mes, dia, tzinfo=timezone.utc)
+        except ValueError:
+            return ahora
+
+    m_hace = re.search(r"hace\s+(\d+)\s+([a-z]+)", texto)
+    if m_hace:
+        cantidad = int(m_hace.group(1))
+        unidad = m_hace.group(2)
+    else:
+        m_simple = re.search(r"(\d+)\s*(h|min|d|sem|mo)", texto)
+        if not m_simple:
+            return ahora
+        cantidad = int(m_simple.group(1))
+        unidad = m_simple.group(2)
+
+    if unidad.startswith("min"):
+        return ahora - timedelta(minutes=cantidad)
+    if unidad.startswith("h"):
+        return ahora - timedelta(hours=cantidad)
+    if unidad.startswith("d") or unidad.startswith("dia"):
+        return ahora - timedelta(days=cantidad)
+    if unidad.startswith("sem"):
+        return ahora - timedelta(weeks=cantidad)
+    if unidad.startswith("mo") or unidad.startswith("mes"):
+        return ahora - timedelta(days=30 * cantidad)
+
+    return ahora
+
+
+def guardar_resultados_db(nombre: str, seguidores: str, posts: list) -> tuple[bool, str]:
+    if psycopg is None:
+        return False, "No se encontro psycopg. Instala: pip install psycopg[binary]"
+
+    host = os.getenv("PGHOST", "localhost")
+    port = int(os.getenv("PGPORT", "5433"))
+    dbname = os.getenv("PGDATABASE", "linkedin_db")
+    user = os.getenv("PGUSER", "user")
+    password = os.getenv("PGPASSWORD", "1234")
+
+    try:
+        with psycopg.connect(
+            host=host,
+            port=port,
+            dbname=dbname,
+            user=user,
+            password=password,
+        ) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO public.perfiles (nombre_usuario)
+                    VALUES (%s)
+                    ON CONFLICT (nombre_usuario)
+                    DO UPDATE SET nombre_usuario = EXCLUDED.nombre_usuario
+                    RETURNING id
+                    """,
+                    (nombre,),
+                )
+                perfil_id = cur.fetchone()[0]
+
+                cur.execute(
+                    """
+                    INSERT INTO public.metricas_perfil (
+                        perfil_id, impresiones_totales, seguidores
+                    )
+                    VALUES (%s, %s, %s)
+                    """,
+                    (perfil_id, 0, convertir_a_entero(seguidores)),
+                )
+
+                for post in posts:
+                    cur.execute(
+                        """
+                        INSERT INTO public.publicaciones (
+                            perfil_id, id_publicacion, fecha_publicacion,
+                            reacciones, comentarios, compartidos, envios
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (perfil_id, id_publicacion)
+                        DO UPDATE SET
+                            fecha_publicacion = EXCLUDED.fecha_publicacion,
+                            reacciones = EXCLUDED.reacciones,
+                            comentarios = EXCLUDED.comentarios,
+                            compartidos = EXCLUDED.compartidos,
+                            envios = EXCLUDED.envios
+                        """,
+                        (
+                            perfil_id,
+                            post["id_publicacion"],
+                            convertir_fecha_publicacion(post.get("fecha", "")).date(),
+                            convertir_a_entero(post.get("recomendaciones", "0")),
+                            convertir_a_entero(post.get("comentarios", "0")),
+                            convertir_a_entero(post.get("compartidos", "0")),
+                            convertir_a_entero(post.get("envios", "0")),
+                        ),
+                    )
+
+        return True, f"Datos guardados en PostgreSQL ({host}:{port}/{dbname})"
+    except Exception as e:
+        return False, f"Error guardando en BD: {e}"
 
 
 def extraer_contenido_desde_tarjeta(tarjeta) -> str:
@@ -257,19 +401,25 @@ def extraer_posts(page, cantidad: int):
                 recomendaciones = extraer_recomendaciones(tarjeta, texto_tarjeta)
                 comentarios = extraer_comentarios(texto_tarjeta)
                 compartidos = extraer_compartidos(texto_tarjeta)
+                envios = extraer_numero_por_etiqueta(texto_tarjeta, r"(?:envios?|sends?)")
 
                 firma = f"{fecha}-{contenido[:80]}"
                 if any(p["firma"] == firma for p in posts):
                     continue
+                id_publicacion = hashlib.sha1(
+                    f"{firma}-{contenido}".encode("utf-8")
+                ).hexdigest()
 
                 posts.append(
                     {
                         "firma": firma,
+                        "id_publicacion": id_publicacion,
                         "contenido": contenido,
                         "fecha": fecha,
                         "recomendaciones": recomendaciones,
                         "comentarios": comentarios,
                         "compartidos": compartidos,
+                        "envios": envios,
                     }
                 )
                 print(f"  Post {len(posts)}/{cantidad} capturado")
@@ -309,10 +459,12 @@ def guardar_resultados_json(
         "posts": [
             {
                 "contenido": post["contenido"],
-                "fecha": post["fecha"],
+                "id_publicacion": post["id_publicacion"],
+                "fecha": convertir_fecha_publicacion(post["fecha"]).date().isoformat(),
                 "recomendaciones": post["recomendaciones"],
                 "comentarios": post["comentarios"],
                 "compartidos": post["compartidos"],
+                "envios": post.get("envios", "0"),
             }
             for post in posts
         ],
@@ -378,6 +530,7 @@ def main():
     salida_json = guardar_resultados_json(
         base_dir, nombre, cantidad, perfil_url, seguidores, posts
     )
+    ok_db, msg_db = guardar_resultados_db(nombre, seguidores, posts)
 
     print("\n" + "=" * 60)
     print(f"RESULTADOS DE {nombre.upper()}")
@@ -398,6 +551,11 @@ def main():
 
     print("\n" + "=" * 60)
     print(f"JSON guardado automaticamente en: {salida_json}")
+    print(msg_db)
+    if not ok_db:
+        print(
+            "Si quieres guardar en BD, revisa credenciales PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD."
+        )
 
 
 if __name__ == "__main__":

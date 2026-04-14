@@ -15,7 +15,7 @@ CREATE TABLE publicaciones (
     id BIGSERIAL PRIMARY KEY,
     perfil_id BIGINT NOT NULL REFERENCES perfiles(id) ON DELETE CASCADE,
     id_publicacion TEXT NOT NULL,
-    fecha_publicacion TIMESTAMPTZ NOT NULL,
+    fecha_publicacion DATE NOT NULL,
     reacciones INTEGER NOT NULL,
     comentarios INTEGER NOT NULL,
     compartidos INTEGER NOT NULL,
