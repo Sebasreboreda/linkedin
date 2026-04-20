@@ -30,6 +30,13 @@ def normalizar_texto(valor: str) -> str:
     return re.sub(r"\s+", " ", valor)
 
 
+def limpiar_valor_texto(valor: str) -> str:
+    limpio = (valor or "").strip()
+    if len(limpio) >= 2 and limpio[0] == limpio[-1] and limpio[0] in {"'", '"'}:
+        return limpio[1:-1].strip()
+    return limpio
+
+
 def extraer_numero_por_etiqueta(texto: str, etiqueta: str) -> str:
     patron_antes = rf"(\d[\d.,\s]*)\s*{etiqueta}"
     patron_despues = rf"{etiqueta}\s*(\d[\d.,\s]*)"
@@ -365,23 +372,23 @@ def abrir_perfil_desde_busqueda(page, nombre_objetivo: str) -> str | None:
     return None
 
 
-def extraer_posts(page, cantidad: int):
+def extraer_posts_ultimo_dia(page):
     posts = []
     page.wait_for_load_state("domcontentloaded")
     delay(2)
+    limite = datetime.now(timezone.utc) - timedelta(days=1)
 
-    # Scroll progresivo hasta alcanzar el numero solicitado.
+    # Scroll progresivo mientras haya opciones de encontrar posts del ultimo dia.
     intentos_scroll = 0
-    max_intentos = max(20, cantidad * 4)
-    while intentos_scroll < max_intentos and len(posts) < cantidad:
+    max_intentos = 40
+    posts_fuera_de_rango_consecutivos = 0
+    while intentos_scroll < max_intentos and posts_fuera_de_rango_consecutivos < 8:
         tarjetas = page.locator("div.feed-shared-update-v2, article")
         total_tarjetas = tarjetas.count()
 
         # Recorremos todas las tarjetas cargadas hasta el momento.
         for i in range(total_tarjetas):
             tarjeta = tarjetas.nth(i)
-            if len(posts) >= cantidad:
-                break
 
             # Aseguramos que la tarjeta se renderice en pantalla.
             try:
@@ -398,6 +405,12 @@ def extraer_posts(page, cantidad: int):
                     continue
 
                 fecha = extraer_fecha(texto_tarjeta)
+                fecha_dt = convertir_fecha_publicacion(fecha)
+                if fecha_dt < limite:
+                    posts_fuera_de_rango_consecutivos += 1
+                    continue
+                posts_fuera_de_rango_consecutivos = 0
+
                 recomendaciones = extraer_recomendaciones(tarjeta, texto_tarjeta)
                 comentarios = extraer_comentarios(texto_tarjeta)
                 compartidos = extraer_compartidos(texto_tarjeta)
@@ -422,25 +435,21 @@ def extraer_posts(page, cantidad: int):
                         "envios": envios,
                     }
                 )
-                print(f"  Post {len(posts)}/{cantidad} capturado")
+                print(f"  Post {len(posts)} capturado")
             except Exception:
                 continue
-
-        if len(posts) >= cantidad:
-            break
 
         # Scroll de carga de mas publicaciones.
         page.mouse.wheel(0, 3500)
         delay(2)
         intentos_scroll += 1
 
-    return posts[:cantidad]
+    return posts
 
 
 def guardar_resultados_json(
     base_dir: str,
     nombre: str,
-    cantidad: int,
     perfil_url: str,
     seguidores: str,
     posts: list,
@@ -453,7 +462,7 @@ def guardar_resultados_json(
         "cuenta_buscada": nombre,
         "perfil_url": perfil_url,
         "seguidores": seguidores,
-        "cantidad_solicitada": cantidad,
+        "filtro_temporal": "ultimo_dia",
         "cantidad_obtenida": len(posts),
         "generado_en": datetime.now().isoformat(timespec="seconds"),
         "posts": [
@@ -476,19 +485,14 @@ def guardar_resultados_json(
     return salida_path
 
 
-def main():
-    nombre = input("Nombre de la cuenta a buscar: ").strip()
+def main(nombre: str | None = None):
+    if nombre is None:
+        nombre = input("Nombre de la cuenta a buscar: ").strip()
+    else:
+        nombre = str(nombre).strip()
+    nombre = limpiar_valor_texto(nombre)
     if not nombre:
         print("Debes introducir un nombre.")
-        return
-
-    try:
-        cantidad = int(input("Numero de posts a sacar: ").strip())
-        if cantidad <= 0:
-            print("El numero debe ser mayor que 0.")
-            return
-    except ValueError:
-        print("Debes introducir un numero valido.")
         return
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -519,16 +523,16 @@ def main():
         print(f"Perfil encontrado: {perfil_url}")
         seguidores = extraer_seguidores_perfil(page)
         print(f"Seguidores detectados: {seguidores}")
-        print("Abriendo actividad para extraer publicaciones...")
+        print("Abriendo actividad para extraer publicaciones del ultimo dia...")
         page.goto(actividad_url)
         page.wait_for_load_state("domcontentloaded")
         delay(2)
 
-        posts = extraer_posts(page, cantidad)
+        posts = extraer_posts_ultimo_dia(page)
         browser.close()
 
     salida_json = guardar_resultados_json(
-        base_dir, nombre, cantidad, perfil_url, seguidores, posts
+        base_dir, nombre, perfil_url, seguidores, posts
     )
     ok_db, msg_db = guardar_resultados_db(nombre, seguidores, posts)
 
