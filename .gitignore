@@ -1,2 +1,8 @@
 __pycache__/
 *.py[cod]
+
+# Ignorar state.json 
+state.json
+
+# Ignorar TODOS los archivos .json
+*.json
