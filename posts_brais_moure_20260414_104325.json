@@ -1,0 +1,37 @@
+{
+  "cuenta_buscada": "brais moure",
+  "perfil_url": "https://www.linkedin.com/in/braismoure/",
+  "seguidores": "No encontrado",
+  "cantidad_solicitada": 3,
+  "cantidad_obtenida": 3,
+  "generado_en": "2026-04-14T10:43:25",
+  "posts": [
+    {
+      "contenido": "💻 ¡Por fin aprender a programar en C es un poco más fácil!\n\nTutorial interactivo GRATIS, paso a paso y en español.\n\n👉 Así funciona:\n→ Seleccionas la lección\n→ Lees la teoría\n→ Resuelves el ejercicio\n\n✨ Todo desde la web, sin instalar nada.\n\n🌐 Lo tienes en: learn-c.org\n\n\nhashtag\n#programacion \nhashtag\n#programadores \nhashtag\n#curso \nhashtag\n#tutorial \nhashtag\n#tecnologia",
+      "id_publicacion": "156d41d7adba79bfd8f8d26dbbc25057fbc8c3a6",
+      "fecha": "2026-04-13",
+      "recomendaciones": "80",
+      "comentarios": "2",
+      "compartidos": "16",
+      "envios": "0"
+    },
+    {
+      "contenido": "Este miércoles tenemos nuevo taller en directo desde mi canal de YouTube...\n\nPor cierto, ya tienes publicados los de OpenClaw y Obsidian.",
+      "id_publicacion": "a2ef4d154cbabe3bfe18693b82c8d2f918340877",
+      "fecha": "2026-04-13",
+      "recomendaciones": "30",
+      "comentarios": "0",
+      "compartidos": "0",
+      "envios": "0"
+    },
+    {
+      "contenido": "Me alegra infinito saber que el curso de Git y GitHub está sirviendo para que mucha gente haga su primera PR.\n\nAhora GitHub coloca la etiqueta \"First-time GitHub contributor\" 💪\n\nEste es mi curso:\n→ https://lnkd.in/dHWzwfmK",
+      "id_publicacion": "5a46788f3b39216d41cb93d6cac146585b25c1d5",
+      "fecha": "2026-04-13",
+      "recomendaciones": "71",
+      "comentarios": "3",
+      "compartidos": "3",
+      "envios": "0"
+    }
+  ]
+}
