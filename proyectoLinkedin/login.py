@@ -96,17 +96,19 @@ with sync_playwright() as p:
             page.wait_for_load_state("domcontentloaded", timeout=15000)
         except Exception:
             pass
-        print("Credenciales insertadas. Si LinkedIn pide MFA/captcha, complétalo y pulsa ENTER.")
+        print("Credenciales insertadas. Continuando automaticamente...") #prueba
     else:
         print("No se encontraron campos de login o LinkedIn usó un flujo diferente.")
-        print("Inicia sesión manualmente en la ventana del navegador y pulsa ENTER.")
+        print("Intentando continuar sin interaccion manual.")
 
-    input("Pulsa ENTER cuando ya veas tu inicio de sesion completado...")
+    # Evita la pausa interactiva: enviamos ENTER y seguimos el flujo.
+    page.keyboard.press("Enter")
     page.goto("https://www.linkedin.com/feed/")
     try:
         page.wait_for_load_state("domcontentloaded", timeout=15000)
     except Exception:
         pass
+
 
     state_path = os.path.join(SCRIPT_DIR, "state.json")
     context.storage_state(path=state_path)
