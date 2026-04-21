@@ -197,6 +197,7 @@ def guardar_resultados_db(nombre: str, seguidores: str, posts: list) -> tuple[bo
             dbname=dbname,
             user=user,
             password=password,
+            connect_timeout=10,
         ) as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -531,11 +532,6 @@ def main(nombre: str | None = None):
         posts = extraer_posts_ultimo_dia(page)
         browser.close()
 
-    salida_json = guardar_resultados_json(
-        base_dir, nombre, perfil_url, seguidores, posts
-    )
-    ok_db, msg_db = guardar_resultados_db(nombre, seguidores, posts)
-
     print("\n" + "=" * 60)
     print(f"RESULTADOS DE {nombre.upper()}")
     print("=" * 60)
@@ -553,13 +549,19 @@ def main(nombre: str | None = None):
         print(f"Comentarios: {post['comentarios']}")
         print(f"Compartidos: {post['compartidos']}")
 
+    salida_json = guardar_resultados_json(
+        base_dir, nombre, perfil_url, seguidores, posts
+    )
+    # print("\nGuardando datos en PostgreSQL...")
+    # ok_db, msg_db = guardar_resultados_db(nombre, seguidores, posts)
+
     print("\n" + "=" * 60)
     print(f"JSON guardado automaticamente en: {salida_json}")
-    print(msg_db)
-    if not ok_db:
-        print(
-            "Si quieres guardar en BD, revisa credenciales PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD."
-        )
+    # print(msg_db)
+    # if not ok_db:
+    #     print(
+    #         "Si quieres guardar en BD, revisa credenciales PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD."
+    #     )
 
 
 if __name__ == "__main__":
