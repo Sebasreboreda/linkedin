@@ -17,6 +17,10 @@ except ImportError:
     psycopg = None
 
 
+# ============================================================
+# Configuración general
+# ============================================================
+
 DEFAULT_MAX_SCROLLS = int(os.getenv("MAX_SCROLLS", "40"))
 DEFAULT_HEADLESS = os.getenv("HEADLESS", "false").lower() in {"1", "true", "yes"}
 DEFAULT_SLOW_MO = int(os.getenv("PLAYWRIGHT_SLOW_MO", "50"))
@@ -27,6 +31,10 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
+
+# ============================================================
+# Utilidades básicas
+# ============================================================
 
 def delay(seconds: float = 2.0) -> None:
     time.sleep(seconds)
@@ -138,13 +146,17 @@ def convertir_fecha_publicacion(valor: str) -> datetime:
     return ahora
 
 
+# ============================================================
+# PostgreSQL
+# ============================================================
+
 def obtener_config_db() -> dict:
     return {
         "host": os.getenv("PGHOST", "localhost"),
-        "port": int(os.getenv("PGPORT", "5433")),
-        "dbname": os.getenv("PGDATABASE", "linkedin_db"),
-        "user": os.getenv("PGUSER", "user"),
-        "password": os.getenv("PGPASSWORD", "1234"),
+        "port": int(os.getenv("PGPORT", "5432")),
+        "dbname": os.getenv("PGDATABASE", "Linkedin_Scrapper"),
+        "user": os.getenv("PGUSER", "postgres"),
+        "password": os.getenv("PGPASSWORD", ""),
         "connect_timeout": 10,
     }
 
@@ -155,10 +167,20 @@ def abrir_conexion_db():
             "No se encontró psycopg. Instala la dependencia con: pip install psycopg[binary]"
         )
 
-    return psycopg.connect(**obtener_config_db())
+    config = obtener_config_db()
+    return psycopg.connect(**config)
 
 
 def obtener_cuentas_linkedin(conn) -> list[dict]:
+    """
+    Obtiene todas las cuentas guardadas en public.perfiles.
+
+    Devuelve una lista con esta forma:
+    [
+        {"id": 1, "nombre_usuario": "Nombre Cuenta"},
+        {"id": 2, "nombre_usuario": "Otra Cuenta"}
+    ]
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -171,10 +193,8 @@ def obtener_cuentas_linkedin(conn) -> list[dict]:
         )
 
         cuentas = []
-
         for perfil_id, nombre_usuario in cur.fetchall():
             nombre_limpio = limpiar_valor_texto(nombre_usuario)
-
             if nombre_limpio:
                 cuentas.append(
                     {
@@ -193,6 +213,16 @@ def guardar_resultados_db(
     posts: list,
     perfil_id: int | None = None,
 ) -> tuple[bool, str]:
+    """
+    Guarda seguidores y publicaciones en PostgreSQL.
+
+    Evita duplicados de publicaciones usando:
+        UNIQUE (perfil_id, id_publicacion)
+
+    Evita duplicar métricas de perfil en el mismo día:
+        - Si existe una métrica del día actual, la actualiza.
+        - Si no existe, inserta una nueva.
+    """
     try:
         with conn.cursor() as cur:
             if perfil_id is None:
@@ -206,7 +236,6 @@ def guardar_resultados_db(
                     """,
                     (nombre,),
                 )
-
                 perfil_id = cur.fetchone()[0]
 
             seguidores_int = convertir_a_entero(seguidores)
@@ -226,6 +255,8 @@ def guardar_resultados_db(
             metrica_existente = cur.fetchone()
 
             if metrica_existente:
+                metrica_id = metrica_existente[0]
+
                 cur.execute(
                     """
                     UPDATE public.metricas_perfil
@@ -237,7 +268,7 @@ def guardar_resultados_db(
                     (
                         0,
                         seguidores_int,
-                        metrica_existente[0],
+                        metrica_id,
                     ),
                 )
             else:
@@ -301,6 +332,10 @@ def guardar_resultados_db(
         return False, f"Error guardando en PostgreSQL para '{nombre}': {e}"
 
 
+# ============================================================
+# Extracción desde LinkedIn
+# ============================================================
+
 def extraer_recomendaciones(tarjeta, texto: str) -> str:
     selectores_reacciones = [
         ".social-details-social-counts__reactions-count",
@@ -312,14 +347,11 @@ def extraer_recomendaciones(tarjeta, texto: str) -> str:
     for selector in selectores_reacciones:
         try:
             loc = tarjeta.locator(selector).first
-
             if loc.count() > 0:
                 txt = (loc.inner_text(timeout=1500) or "").strip()
                 m = re.search(r"(\d[\d.,]*)", txt)
-
                 if m:
                     return normalizar_numero(m.group(1))
-
         except Exception:
             continue
 
@@ -343,7 +375,6 @@ def extraer_recomendaciones(tarjeta, texto: str) -> str:
             continue
 
         m = re.search(r"(\d[\d.,]*)", linea)
-
         if m:
             return normalizar_numero(m.group(1))
 
@@ -352,7 +383,6 @@ def extraer_recomendaciones(tarjeta, texto: str) -> str:
 
 def extraer_comentarios(texto: str) -> str:
     m = re.search(r"\b(\d[\d.,]*)\s*comentarios?\b", texto, re.IGNORECASE)
-
     if m:
         return normalizar_numero(m.group(1))
 
@@ -395,13 +425,10 @@ def extraer_contenido_desde_tarjeta(tarjeta) -> str:
     for selector in selectores_contenido:
         try:
             loc = tarjeta.locator(selector).first
-
             if loc.count() > 0:
                 texto = (loc.inner_text(timeout=2000) or "").strip()
-
                 if texto:
                     return texto[:1200]
-
         except Exception:
             continue
 
@@ -461,7 +488,6 @@ def abrir_perfil_desde_busqueda(page, nombre_objetivo: str) -> str | None:
 
         try:
             href = (link.get_attribute("href") or "").split("?")[0]
-
             if "/in/" not in href:
                 continue
 
@@ -650,6 +676,10 @@ def extraer_posts_ultimo_dia(page, max_intentos: int = DEFAULT_MAX_SCROLLS) -> l
     return posts
 
 
+# ============================================================
+# Guardado JSON
+# ============================================================
+
 def guardar_resultados_json(
     base_dir: str,
     nombre: str,
@@ -691,6 +721,10 @@ def guardar_resultados_json(
 
     return salida_path
 
+
+# ============================================================
+# Flujo de scraping por cuenta
+# ============================================================
 
 def scrapear_cuenta(page, nombre: str) -> dict:
     logging.info("Buscando perfil de: %s", nombre)
@@ -826,6 +860,10 @@ def procesar_cuenta(
         except Exception:
             pass
 
+
+# ============================================================
+# Main
+# ============================================================
 
 def main(
     nombre: str | None = None,
