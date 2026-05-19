@@ -16,6 +16,7 @@ CREATE TABLE publicaciones (
     perfil_id BIGINT NOT NULL REFERENCES perfiles(id) ON DELETE CASCADE,
     id_publicacion TEXT NOT NULL,
     fecha_publicacion DATE NOT NULL,
+    contenido TEXT,
     reacciones INTEGER NOT NULL,
     comentarios INTEGER NOT NULL,
     compartidos INTEGER NOT NULL,

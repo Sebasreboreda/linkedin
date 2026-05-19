@@ -16,14 +16,26 @@ try:
 except ImportError:
     psycopg = None
 
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
 
 # ============================================================
 # Configuración general
 # ============================================================
 
-DEFAULT_MAX_SCROLLS = int(os.getenv("MAX_SCROLLS", "40"))
-DEFAULT_HEADLESS = os.getenv("HEADLESS", "false").lower() in {"1", "true", "yes"}
-DEFAULT_SLOW_MO = int(os.getenv("PLAYWRIGHT_SLOW_MO", "50"))
+def _leer_max_scrolls() -> int:
+    return int(os.getenv("MAX_SCROLLS", "40"))
+
+
+def _leer_headless_env() -> bool:
+    return os.getenv("HEADLESS", "false").lower() in {"1", "true", "yes"}
+
+
+def _leer_slow_mo() -> int:
+    return int(os.getenv("PLAYWRIGHT_SLOW_MO", "50"))
 
 
 logging.basicConfig(
@@ -95,6 +107,24 @@ def convertir_a_entero(valor: str) -> int:
     return int(solo_digitos) if solo_digitos else 0
 
 
+def _parsear_cantidad_unidad_relativa(texto: str) -> tuple[int, str] | None:
+    m_hace = re.search(
+        r"hace\s+(\d+)\s+(min(?:utos?)?|h(?:oras?)?|d(?:ias?)?|sem(?:anas?)?|mes(?:es)?|mo)",
+        texto,
+    )
+    if m_hace:
+        return int(m_hace.group(1)), m_hace.group(2)
+
+    m_simple = re.search(
+        r"(\d+)\s*(min(?:utos?)?|h(?:oras?)?|d(?:ias?)?|sem(?:anas?)?|mes(?:es)?|mo|w|weeks?)",
+        texto,
+    )
+    if m_simple:
+        return int(m_simple.group(1)), m_simple.group(2)
+
+    return None
+
+
 def convertir_fecha_publicacion(valor: str) -> datetime:
     if not valor:
         return datetime.now(timezone.utc)
@@ -116,17 +146,11 @@ def convertir_fecha_publicacion(valor: str) -> datetime:
         except ValueError:
             return ahora
 
-    m_hace = re.search(r"hace\s+(\d+)\s+([a-z]+)", texto)
-    if m_hace:
-        cantidad = int(m_hace.group(1))
-        unidad = m_hace.group(2)
-    else:
-        m_simple = re.search(r"(\d+)\s*(h|min|d|sem|mo)", texto)
-        if not m_simple:
-            return ahora
+    parsed = _parsear_cantidad_unidad_relativa(texto)
+    if not parsed:
+        return ahora
 
-        cantidad = int(m_simple.group(1))
-        unidad = m_simple.group(2)
+    cantidad, unidad = parsed
 
     if unidad.startswith("min"):
         return ahora - timedelta(minutes=cantidad)
@@ -137,7 +161,7 @@ def convertir_fecha_publicacion(valor: str) -> datetime:
     if unidad.startswith("d") or unidad.startswith("dia"):
         return ahora - timedelta(days=cantidad)
 
-    if unidad.startswith("sem"):
+    if unidad.startswith("sem") or unidad.startswith("w"):
         return ahora - timedelta(weeks=cantidad)
 
     if unidad.startswith("mo") or unidad.startswith("mes"):
@@ -146,19 +170,72 @@ def convertir_fecha_publicacion(valor: str) -> datetime:
     return ahora
 
 
+def post_fuera_de_ventana(fecha_str: str, limite: datetime, dias_ventana: int) -> bool:
+    """
+    True si el post es anterior al límite.
+    Trata bien las etiquetas de LinkedIn (sem., mes, mo) para cortar al llegar al mes.
+    """
+    texto = normalizar_texto(fecha_str or "")
+    if not texto or "fecha no encontrada" in texto:
+        return False
+
+    meses_ventana = max(1, (dias_ventana + 29) // 30)
+    parsed = _parsear_cantidad_unidad_relativa(texto)
+
+    if parsed:
+        cantidad, unidad = parsed
+        if unidad.startswith("mo") or unidad.startswith("mes"):
+            # Parar al llegar a "1 mes" (o al mes configurado en SCRAPING_MONTHS_INITIAL)
+            if cantidad >= meses_ventana:
+                return True
+        if unidad.startswith("sem") or unidad.startswith("w"):
+            if cantidad * 7 > dias_ventana:
+                return True
+        if unidad.startswith("d") or unidad.startswith("dia"):
+            if cantidad > dias_ventana:
+                return True
+
+    return convertir_fecha_publicacion(fecha_str) < limite
+
+
+def fecha_indica_fin_de_ventana(fecha_str: str, dias_ventana: int) -> bool:
+    """True al aparecer 1 mes (o el mes límite): detiene el scroll de inmediato."""
+    texto = normalizar_texto(fecha_str or "")
+    parsed = _parsear_cantidad_unidad_relativa(texto)
+    meses_ventana = max(1, (dias_ventana + 29) // 30)
+
+    if parsed:
+        cantidad, unidad = parsed
+        if unidad.startswith("mo") or unidad.startswith("mes"):
+            return cantidad >= meses_ventana
+
+    return bool(
+        re.search(
+            rf"\b{meses_ventana}\s*(?:mo|mes(?:es)?|month)\b",
+            texto,
+        )
+    )
+
+
 # ============================================================
 # PostgreSQL
 # ============================================================
 
 def obtener_config_db() -> dict:
-    return {
+    password = os.getenv("PGPASSWORD")
+    if password is None:
+        password = "1234"
+
+    config = {
         "host": os.getenv("PGHOST", "localhost"),
         "port": int(os.getenv("PGPORT", "5432")),
-        "dbname": os.getenv("PGDATABASE", "Linkedin_Scrapper"),
-        "user": os.getenv("PGUSER", "postgres"),
-        "password": os.getenv("PGPASSWORD", ""),
+        "dbname": os.getenv("PGDATABASE", "linkedin_db"),
+        "user": os.getenv("PGUSER", "user"),
         "connect_timeout": 10,
     }
+    if password != "":
+        config["password"] = password
+    return config
 
 
 def abrir_conexion_db():
@@ -169,6 +246,246 @@ def abrir_conexion_db():
 
     config = obtener_config_db()
     return psycopg.connect(**config)
+
+
+def verificar_y_migrar_esquema(conn) -> tuple[bool, str]:
+    """Comprueba tablas requeridas y añade columnas nuevas si faltan."""
+    tablas_requeridas = ("perfiles", "metricas_perfil", "publicaciones")
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name = ANY(%s)
+                """,
+                (list(tablas_requeridas),),
+            )
+            encontradas = {fila[0] for fila in cur.fetchall()}
+            faltantes = [t for t in tablas_requeridas if t not in encontradas]
+            if faltantes:
+                return (
+                    False,
+                    "Faltan tablas en public: "
+                    + ", ".join(faltantes)
+                    + ". Ejecuta schema.sql en la base de datos.",
+                )
+
+            cur.execute(
+                """
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'publicaciones'
+                  AND column_name = 'contenido'
+                """
+            )
+            if not cur.fetchone():
+                cur.execute(
+                    "ALTER TABLE public.publicaciones "
+                    "ADD COLUMN contenido TEXT"
+                )
+                logging.info("Columna publicaciones.contenido añadida.")
+
+        conn.commit()
+        return True, "Esquema PostgreSQL verificado."
+    except Exception as e:
+        conn.rollback()
+        return False, f"Error verificando esquema: {e}"
+
+
+def asegurar_perfil_id(conn, nombre: str) -> int:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO public.perfiles (nombre_usuario)
+            VALUES (%s)
+            ON CONFLICT (nombre_usuario)
+            DO UPDATE SET nombre_usuario = EXCLUDED.nombre_usuario
+            RETURNING id
+            """,
+            (nombre,),
+        )
+        perfil_id = cur.fetchone()[0]
+    return perfil_id
+
+
+def cargar_variables_entorno(base_dir: str) -> None:
+    env_path = os.path.join(base_dir, ".env")
+    if load_dotenv and os.path.exists(env_path):
+        load_dotenv(dotenv_path=env_path, override=True)
+
+
+def leer_entero_env(
+    nombre: str,
+    default: int,
+    minimo: int = 1,
+    maximo: int = 365,
+) -> int:
+    raw = (os.getenv(nombre) or "").strip()
+    if not raw:
+        return default
+    try:
+        valor = int(raw)
+    except ValueError:
+        logging.warning("%s inválido (%r), usando %s", nombre, raw, default)
+        return default
+    return max(minimo, min(maximo, valor))
+
+
+def obtener_scraping_days() -> int:
+    """Días de intervalo y de consulta (variable unificada SCRAPING_DAYS)."""
+    return leer_entero_env("SCRAPING_DAYS", 1)
+
+
+def obtener_meses_inicial() -> int:
+    """Meses hacia atrás para perfiles sin datos en BD (SCRAPING_MONTHS_INITIAL)."""
+    return leer_entero_env("SCRAPING_MONTHS_INITIAL", 1, minimo=1, maximo=24)
+
+
+def obtener_dias_perfil_inicial() -> int:
+    """Convierte meses del .env a días (~30 por mes)."""
+    return obtener_meses_inicial() * 30
+
+
+def obtener_config_ventana_temporal() -> tuple[int, int]:
+    """(perfil_con_datos, perfil_vacio_en_bd)."""
+    return obtener_scraping_days(), obtener_dias_perfil_inicial()
+
+
+def describir_ventana_temporal(dias: int) -> str:
+    if dias <= 1:
+        return "último día"
+    meses = dias // 30
+    if dias % 30 == 0 and meses >= 1:
+        return f"último mes" if meses == 1 else f"últimos {meses} meses"
+    return f"últimos {dias} días"
+
+
+def parsear_lista_cuentas(raw: str) -> list[str]:
+    if not raw:
+        return []
+
+    nombres = []
+    for parte in re.split(r"[;\n|]+", raw):
+        nombre = limpiar_valor_texto(parte)
+        if nombre and nombre not in nombres:
+            nombres.append(nombre)
+    return nombres
+
+
+def obtener_cuentas_desde_env() -> list[dict]:
+    cuentas_raw = parsear_lista_cuentas(os.getenv("SCRAPING_ACCOUNTS", ""))
+
+    if not cuentas_raw:
+        cuenta_unica = limpiar_valor_texto(os.getenv("SCRAPING_ACCOUNT", ""))
+        if cuenta_unica:
+            cuentas_raw = [cuenta_unica]
+
+    return [
+        {"id": None, "nombre_usuario": nombre}
+        for nombre in cuentas_raw
+    ]
+
+
+def cuenta_ya_en_lista(cuentas: list[dict], nombre: str) -> bool:
+    objetivo = normalizar_texto(nombre)
+    return any(
+        normalizar_texto(c["nombre_usuario"]) == objetivo
+        for c in cuentas
+    )
+
+
+def perfil_tiene_publicaciones(
+    conn,
+    perfil_id: int | None,
+    nombre: str,
+) -> bool:
+    with conn.cursor() as cur:
+        if perfil_id is not None:
+            cur.execute(
+                """
+                SELECT 1
+                FROM public.publicaciones
+                WHERE perfil_id = %s
+                LIMIT 1
+                """,
+                (perfil_id,),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT 1
+                FROM public.publicaciones p
+                INNER JOIN public.perfiles pf ON pf.id = p.perfil_id
+                WHERE lower(btrim(pf.nombre_usuario)) = lower(btrim(%s))
+                LIMIT 1
+                """,
+                (nombre,),
+            )
+        return cur.fetchone() is not None
+
+
+def dias_atras_para_cuenta(conn, cuenta: dict) -> int:
+    """Días según SCRAPING_DAYS / SCRAPING_MONTHS_INITIAL (.env)."""
+    dias_con_datos, dias_perfil_vacio = obtener_config_ventana_temporal()
+    if conn is None:
+        return dias_perfil_vacio
+    if perfil_tiene_publicaciones(
+        conn,
+        cuenta.get("id"),
+        cuenta.get("nombre_usuario", ""),
+    ):
+        return dias_con_datos
+    return dias_perfil_vacio
+
+
+def resolver_cuentas_sin_db(nombre: str | None = None) -> tuple[list[dict], str]:
+    if nombre:
+        nombre_limpio = limpiar_valor_texto(nombre)
+        if not nombre_limpio:
+            return [], "ninguna"
+        return [{"id": None, "nombre_usuario": nombre_limpio}], "manual"
+
+    cuentas_env = obtener_cuentas_desde_env()
+    if cuentas_env:
+        return cuentas_env, "env"
+    return [], "ninguna"
+
+
+def resolver_cuentas_a_scrapear(
+    conn,
+    nombre: str | None = None,
+) -> tuple[list[dict], str]:
+    """
+    Devuelve (cuentas, origen).
+    - BD con perfiles: cuentas de la BD + nuevas del .env no duplicadas.
+    - BD vacía: solo cuentas del .env.
+    La ventana temporal (1 vs 30 días) se resuelve por perfil en dias_atras_para_cuenta.
+    """
+    if nombre:
+        nombre_limpio = limpiar_valor_texto(nombre)
+        if not nombre_limpio:
+            return [], "ninguna"
+        return [{"id": None, "nombre_usuario": nombre_limpio}], "manual"
+
+    cuentas_db = obtener_cuentas_linkedin(conn)
+    if cuentas_db:
+        cuentas = list(cuentas_db)
+        origen = "base_datos"
+        for cuenta_env in obtener_cuentas_desde_env():
+            nombre_env = cuenta_env["nombre_usuario"]
+            if not cuenta_ya_en_lista(cuentas, nombre_env):
+                cuentas.append(cuenta_env)
+                if origen == "base_datos":
+                    origen = "base_datos+env"
+        return cuentas, origen
+
+    cuentas_env = obtener_cuentas_desde_env()
+    if cuentas_env:
+        return cuentas_env, "env"
+
+    return [], "ninguna"
 
 
 def obtener_cuentas_linkedin(conn) -> list[dict]:
@@ -224,22 +541,20 @@ def guardar_resultados_db(
         - Si no existe, inserta una nueva.
     """
     try:
+        perfil_id = asegurar_perfil_id(conn, nombre)
+
+        seguidores_int = convertir_a_entero(seguidores)
+        if seguidores_int == 0 and seguidores.strip().lower() not in {"0", ""}:
+            logging.warning(
+                "Seguidores no numéricos para '%s' (%r); se guardará como 0.",
+                nombre,
+                seguidores,
+            )
+
+        guardados = 0
+        omitidos = 0
+
         with conn.cursor() as cur:
-            if perfil_id is None:
-                cur.execute(
-                    """
-                    INSERT INTO public.perfiles (nombre_usuario)
-                    VALUES (%s)
-                    ON CONFLICT (nombre_usuario)
-                    DO UPDATE SET nombre_usuario = EXCLUDED.nombre_usuario
-                    RETURNING id
-                    """,
-                    (nombre,),
-                )
-                perfil_id = cur.fetchone()[0]
-
-            seguidores_int = convertir_a_entero(seguidores)
-
             cur.execute(
                 """
                 SELECT id
@@ -255,8 +570,6 @@ def guardar_resultados_db(
             metrica_existente = cur.fetchone()
 
             if metrica_existente:
-                metrica_id = metrica_existente[0]
-
                 cur.execute(
                     """
                     UPDATE public.metricas_perfil
@@ -265,11 +578,7 @@ def guardar_resultados_db(
                         seguidores = %s
                     WHERE id = %s
                     """,
-                    (
-                        0,
-                        seguidores_int,
-                        metrica_id,
-                    ),
+                    (0, seguidores_int, metrica_existente[0]),
                 )
             else:
                 cur.execute(
@@ -281,54 +590,71 @@ def guardar_resultados_db(
                     )
                     VALUES (%s, %s, %s)
                     """,
-                    (
-                        perfil_id,
-                        0,
-                        seguidores_int,
-                    ),
+                    (perfil_id, 0, seguidores_int),
                 )
 
             for post in posts:
-                cur.execute(
-                    """
-                    INSERT INTO public.publicaciones (
-                        perfil_id,
-                        id_publicacion,
-                        fecha_publicacion,
-                        reacciones,
-                        comentarios,
-                        compartidos,
-                        envios
+                try:
+                    cur.execute("SAVEPOINT guardar_post")
+                    cur.execute(
+                        """
+                        INSERT INTO public.publicaciones (
+                            perfil_id,
+                            id_publicacion,
+                            fecha_publicacion,
+                            contenido,
+                            reacciones,
+                            comentarios,
+                            compartidos,
+                            envios
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (perfil_id, id_publicacion)
+                        DO UPDATE SET
+                            fecha_publicacion = EXCLUDED.fecha_publicacion,
+                            contenido = EXCLUDED.contenido,
+                            reacciones = EXCLUDED.reacciones,
+                            comentarios = EXCLUDED.comentarios,
+                            compartidos = EXCLUDED.compartidos,
+                            envios = EXCLUDED.envios
+                        """,
+                        (
+                            perfil_id,
+                            post["id_publicacion"],
+                            convertir_fecha_publicacion(
+                                post.get("fecha", "")
+                            ).date(),
+                            (post.get("contenido") or "")[:4000],
+                            convertir_a_entero(post.get("recomendaciones", "0")),
+                            convertir_a_entero(post.get("comentarios", "0")),
+                            convertir_a_entero(post.get("compartidos", "0")),
+                            convertir_a_entero(post.get("envios", "0")),
+                        ),
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (perfil_id, id_publicacion)
-                    DO UPDATE SET
-                        fecha_publicacion = EXCLUDED.fecha_publicacion,
-                        reacciones = EXCLUDED.reacciones,
-                        comentarios = EXCLUDED.comentarios,
-                        compartidos = EXCLUDED.compartidos,
-                        envios = EXCLUDED.envios
-                    """,
-                    (
-                        perfil_id,
-                        post["id_publicacion"],
-                        convertir_fecha_publicacion(post.get("fecha", "")).date(),
-                        convertir_a_entero(post.get("recomendaciones", "0")),
-                        convertir_a_entero(post.get("comentarios", "0")),
-                        convertir_a_entero(post.get("compartidos", "0")),
-                        convertir_a_entero(post.get("envios", "0")),
-                    ),
-                )
+                    cur.execute("RELEASE SAVEPOINT guardar_post")
+                    guardados += 1
+                except Exception as e:
+                    cur.execute("ROLLBACK TO SAVEPOINT guardar_post")
+                    omitidos += 1
+                    logging.warning(
+                        "Post omitido para '%s' (id=%s): %s",
+                        nombre,
+                        post.get("id_publicacion"),
+                        e,
+                    )
 
         conn.commit()
 
         return (
             True,
-            f"Datos guardados en PostgreSQL para '{nombre}'. Posts procesados: {len(posts)}",
+            f"BD OK '{nombre}' (perfil_id={perfil_id}): "
+            f"{guardados} publicaciones guardadas, {omitidos} omitidas, "
+            f"seguidores={seguidores_int}.",
         )
 
     except Exception as e:
         conn.rollback()
+        logging.exception("Error guardando en PostgreSQL para '%s'", nombre)
         return False, f"Error guardando en PostgreSQL para '{nombre}': {e}"
 
 
@@ -404,7 +730,9 @@ def extraer_compartidos(texto: str) -> str:
 
 def extraer_fecha(texto: str) -> str:
     fecha_match = re.search(
-        r"(\d+\s*(?:h|min|sem|d)|\d+\s*mo|hace\s+\d+\s+\w+|\d{1,2}/\d{1,2}/\d{2,4})",
+        r"(\d+\s*(?:h|min|d|sem(?:anas?)?|mes(?:es)?|mo|w)|"
+        r"hace\s+\d+\s+(?:min(?:utos?)?|h(?:oras?)?|d(?:ias?)?|sem(?:anas?)?|mes(?:es)?|mo)|"
+        r"\d{1,2}/\d{1,2}/\d{2,4})",
         texto,
         re.IGNORECASE,
     )
@@ -576,19 +904,75 @@ def abrir_perfil_desde_busqueda(page, nombre_objetivo: str) -> str | None:
     return None
 
 
-def extraer_posts_ultimo_dia(page, max_intentos: int = DEFAULT_MAX_SCROLLS) -> list[dict]:
+def _scroll_y_actual(page) -> float:
+    try:
+        return float(
+            page.evaluate(
+                "() => window.scrollY || document.documentElement.scrollTop || 0"
+            )
+        )
+    except Exception:
+        return 0.0
+
+
+def _scroll_cargar_mas_publicaciones(page, tarjetas, total_tarjetas: int) -> None:
+    """Avanza el scroll sin volver arriba: ancla la última tarjeta y scrollBy incremental."""
+    scroll_antes = _scroll_y_actual(page)
+
+    if total_tarjetas > 0:
+        try:
+            tarjetas.nth(total_tarjetas - 1).evaluate(
+                """(el) => el.scrollIntoView({
+                    block: 'end',
+                    inline: 'nearest',
+                    behavior: 'instant'
+                })"""
+            )
+        except Exception:
+            pass
+
+    try:
+        page.evaluate(
+            """() => {
+                const paso = Math.max(window.innerHeight * 0.85, 500);
+                window.scrollBy({ top: paso, left: 0, behavior: 'instant' });
+            }"""
+        )
+    except Exception:
+        pass
+
+    delay(1.5)
+
+    if _scroll_y_actual(page) <= scroll_antes + 20:
+        try:
+            page.evaluate(
+                "() => window.scrollBy({ top: 1200, left: 0, behavior: 'instant' })"
+            )
+        except Exception:
+            pass
+        delay(1)
+
+
+def extraer_posts_por_antiguedad(
+    page,
+    dias_atras: int = 1,
+    max_intentos: int | None = None,
+) -> list[dict]:
+    if max_intentos is None:
+        max_intentos = _leer_max_scrolls()
     posts = []
     firmas_vistas = set()
 
     page.wait_for_load_state("domcontentloaded")
     delay(2)
 
-    limite = datetime.now(timezone.utc) - timedelta(days=1)
+    limite = datetime.now(timezone.utc) - timedelta(days=dias_atras)
+    logging.info("Filtro temporal: %s (%s días)", describir_ventana_temporal(dias_atras), dias_atras)
 
     intentos_scroll = 0
     posts_fuera_de_rango_consecutivos = 0
-    total_tarjetas_anterior = 0
     scrolls_sin_nuevas_tarjetas = 0
+    ultimo_indice_procesado = 0
 
     while (
         intentos_scroll < max_intentos
@@ -598,21 +982,21 @@ def extraer_posts_ultimo_dia(page, max_intentos: int = DEFAULT_MAX_SCROLLS) -> l
         tarjetas = page.locator("div.feed-shared-update-v2, article")
         total_tarjetas = tarjetas.count()
 
-        if total_tarjetas <= total_tarjetas_anterior:
+        if total_tarjetas < ultimo_indice_procesado:
+            logging.debug(
+                "El feed se recargó (%s -> %s tarjetas); reiniciando índice.",
+                ultimo_indice_procesado,
+                total_tarjetas,
+            )
+            ultimo_indice_procesado = 0
+
+        if total_tarjetas <= ultimo_indice_procesado:
             scrolls_sin_nuevas_tarjetas += 1
         else:
             scrolls_sin_nuevas_tarjetas = 0
-            total_tarjetas_anterior = total_tarjetas
 
-        for i in range(total_tarjetas):
+        for i in range(ultimo_indice_procesado, total_tarjetas):
             tarjeta = tarjetas.nth(i)
-
-            try:
-                tarjeta.scroll_into_view_if_needed(timeout=2500)
-            except Exception:
-                pass
-
-            delay(0.2)
 
             try:
                 contenido = extraer_contenido_desde_tarjeta(tarjeta)
@@ -622,10 +1006,15 @@ def extraer_posts_ultimo_dia(page, max_intentos: int = DEFAULT_MAX_SCROLLS) -> l
                     continue
 
                 fecha = extraer_fecha(texto_tarjeta)
-                fecha_dt = convertir_fecha_publicacion(fecha)
 
-                if fecha_dt < limite:
+                if post_fuera_de_ventana(fecha, limite, dias_atras):
                     posts_fuera_de_rango_consecutivos += 1
+                    if fecha_indica_fin_de_ventana(fecha, dias_atras):
+                        logging.info(
+                            "Fecha '%s' (límite del mes alcanzado); deteniendo scroll.",
+                            fecha,
+                        )
+                        posts_fuera_de_rango_consecutivos = 8
                     continue
 
                 posts_fuera_de_rango_consecutivos = 0
@@ -668,8 +1057,8 @@ def extraer_posts_ultimo_dia(page, max_intentos: int = DEFAULT_MAX_SCROLLS) -> l
                 logging.debug("Error procesando una tarjeta: %s", e)
                 continue
 
-        page.mouse.wheel(0, 3500)
-        delay(2)
+        ultimo_indice_procesado = total_tarjetas
+        _scroll_cargar_mas_publicaciones(page, tarjetas, total_tarjetas)
 
         intentos_scroll += 1
 
@@ -686,6 +1075,7 @@ def guardar_resultados_json(
     perfil_url: str,
     seguidores: str,
     posts: list,
+    filtro_temporal: str = "ultimo_dia",
 ) -> str:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     nombre_limpio = re.sub(r"[^a-zA-Z0-9_-]+", "_", nombre).strip("_") or "cuenta"
@@ -699,7 +1089,7 @@ def guardar_resultados_json(
         "cuenta_buscada": nombre,
         "perfil_url": perfil_url,
         "seguidores": seguidores,
-        "filtro_temporal": "ultimo_dia",
+        "filtro_temporal": filtro_temporal,
         "cantidad_obtenida": len(posts),
         "generado_en": datetime.now().isoformat(timespec="seconds"),
         "posts": [
@@ -726,7 +1116,7 @@ def guardar_resultados_json(
 # Flujo de scraping por cuenta
 # ============================================================
 
-def scrapear_cuenta(page, nombre: str) -> dict:
+def scrapear_cuenta(page, nombre: str, dias_atras: int = 1) -> dict:
     logging.info("Buscando perfil de: %s", nombre)
 
     perfil_url = abrir_perfil_desde_busqueda(page, nombre)
@@ -746,13 +1136,14 @@ def scrapear_cuenta(page, nombre: str) -> dict:
     page.goto(actividad_url, wait_until="domcontentloaded")
     delay(2)
 
-    posts = extraer_posts_ultimo_dia(page)
+    posts = extraer_posts_por_antiguedad(page, dias_atras=dias_atras)
 
     return {
         "nombre": nombre,
         "perfil_url": perfil_url,
         "seguidores": seguidores,
         "posts": posts,
+        "dias_atras": dias_atras,
     }
 
 
@@ -765,7 +1156,11 @@ def imprimir_resultados_cuenta(resultado: dict) -> None:
     print(f"RESULTADOS DE {nombre.upper()}")
     print("=" * 60)
     print(f"Seguidores: {seguidores}")
-    print(f"Publicaciones encontradas en el último día: {len(posts)}")
+    dias = resultado.get("dias_atras", 1)
+    print(
+        f"Publicaciones encontradas en {describir_ventana_temporal(dias)}: "
+        f"{len(posts)}"
+    )
 
     if not posts:
         print("No se encontraron publicaciones recientes.")
@@ -787,6 +1182,7 @@ def procesar_cuenta(
     cuenta: dict,
     base_dir: str,
     guardar_json: bool = True,
+    dias_atras: int = 1,
 ) -> dict:
     nombre = limpiar_valor_texto(cuenta["nombre_usuario"])
     perfil_id = cuenta.get("id")
@@ -802,8 +1198,10 @@ def procesar_cuenta(
     page = context.new_page()
 
     try:
-        resultado = scrapear_cuenta(page, nombre)
+        resultado = scrapear_cuenta(page, nombre, dias_atras=dias_atras)
         imprimir_resultados_cuenta(resultado)
+
+        filtro_temporal = f"ultimos_{dias_atras}_dias"
 
         salida_json = None
 
@@ -814,25 +1212,30 @@ def procesar_cuenta(
                 perfil_url=resultado["perfil_url"],
                 seguidores=resultado["seguidores"],
                 posts=resultado["posts"],
+                filtro_temporal=filtro_temporal,
             )
 
             logging.info("JSON guardado en: %s", salida_json)
 
-        ok_db, msg_db = guardar_resultados_db(
-            conn=conn,
-            nombre=nombre,
-            seguidores=resultado["seguidores"],
-            posts=resultado["posts"],
-            perfil_id=perfil_id,
-        )
+        ok_db = False
+        msg_db = "BD no disponible (scraping guardado solo en JSON/consola)."
 
-        if ok_db:
-            logging.info(msg_db)
-        else:
-            logging.error(msg_db)
+        if conn is not None:
+            ok_db, msg_db = guardar_resultados_db(
+                conn=conn,
+                nombre=nombre,
+                seguidores=resultado["seguidores"],
+                posts=resultado["posts"],
+                perfil_id=perfil_id,
+            )
+            if ok_db:
+                logging.info(msg_db)
+            else:
+                logging.error(msg_db)
 
         return {
-            "ok": ok_db,
+            "ok": True,
+            "db_ok": ok_db,
             "nombre": nombre,
             "posts": len(resultado["posts"]),
             "json": salida_json,
@@ -865,12 +1268,20 @@ def procesar_cuenta(
 # Main
 # ============================================================
 
+def resolver_headless(cli_headless: bool) -> bool:
+    if cli_headless:
+        return True
+    return _leer_headless_env()
+
+
 def main(
     nombre: str | None = None,
     guardar_json: bool = True,
-    headless: bool = DEFAULT_HEADLESS,
+    headless: bool = False,
 ) -> None:
     base_dir = os.path.dirname(os.path.abspath(__file__))
+    cargar_variables_entorno(base_dir)
+    headless = resolver_headless(headless)
     state_path = os.path.join(base_dir, "state.json")
 
     if not os.path.exists(state_path):
@@ -878,35 +1289,52 @@ def main(
         print("Ejecuta primero login.py para generar state.json.")
         return
 
+    conn = None
+    esquema_ok = False
     try:
         conn = abrir_conexion_db()
+        esquema_ok, msg_esquema = verificar_y_migrar_esquema(conn)
+        if esquema_ok:
+            print(msg_esquema)
+        else:
+            print(f"Error de esquema PostgreSQL: {msg_esquema}")
+            conn.close()
+            conn = None
     except Exception as e:
-        print(f"No se pudo conectar a PostgreSQL: {e}")
-        return
+        print(f"ERROR: no se pudo conectar a PostgreSQL: {e}")
+        print(
+            "Revisa PGHOST, PGPORT, PGDATABASE, PGUSER y PGPASSWORD en .env "
+            "y que el contenedor Docker esté en ejecución."
+        )
+        print("Se continuará con cuentas del .env (sin guardar en BD).")
 
     try:
-        if nombre:
-            nombre_limpio = limpiar_valor_texto(nombre)
-
-            if not nombre_limpio:
-                print("Debes introducir un nombre válido.")
-                return
-
-            cuentas = [
-                {
-                    "id": None,
-                    "nombre_usuario": nombre_limpio,
-                }
-            ]
+        if conn is not None:
+            cuentas, origen = resolver_cuentas_a_scrapear(conn, nombre=nombre)
         else:
-            cuentas = obtener_cuentas_linkedin(conn)
+            cuentas, origen = resolver_cuentas_sin_db(nombre=nombre)
 
         if not cuentas:
-            print("No hay cuentas de LinkedIn guardadas en public.perfiles.")
+            print(
+                "No hay cuentas para scrapear. "
+                "Añade perfiles en la BD o define SCRAPING_ACCOUNTS / SCRAPING_ACCOUNT en .env"
+            )
             return
 
         print("\n" + "=" * 60)
         print(f"Cuentas a scrapear: {len(cuentas)}")
+        print(f"Origen de cuentas: {origen}")
+        scraping_days = obtener_scraping_days()
+        meses_inicial = obtener_meses_inicial()
+        dias_perfil_vacio = obtener_dias_perfil_inicial()
+        print(
+            f"SCRAPING_DAYS={scraping_days}: "
+            f"{describir_ventana_temporal(scraping_days)} por perfil con datos"
+        )
+        print(
+            f"SCRAPING_MONTHS_INITIAL={meses_inicial}: "
+            f"{describir_ventana_temporal(dias_perfil_vacio)} si el perfil está vacío"
+        )
         print("=" * 60)
 
         resultados = []
@@ -914,7 +1342,7 @@ def main(
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=headless,
-                slow_mo=DEFAULT_SLOW_MO,
+                slow_mo=_leer_slow_mo(),
             )
 
             context = browser.new_context(
@@ -930,11 +1358,15 @@ def main(
 
             try:
                 for indice, cuenta in enumerate(cuentas, 1):
+                    dias_atras = dias_atras_para_cuenta(conn, cuenta)
+                    ventana = describir_ventana_temporal(dias_atras)
+
                     print("\n" + "-" * 60)
                     print(
                         f"[{indice}/{len(cuentas)}] Procesando cuenta: "
                         f"{cuenta['nombre_usuario']}"
                     )
+                    print(f"Ventana para esta cuenta: {ventana}")
                     print("-" * 60)
 
                     resultado = procesar_cuenta(
@@ -943,6 +1375,7 @@ def main(
                         cuenta=cuenta,
                         base_dir=base_dir,
                         guardar_json=guardar_json,
+                        dias_atras=dias_atras,
                     )
 
                     resultados.append(resultado)
@@ -961,13 +1394,23 @@ def main(
 
         exitosas = [r for r in resultados if r.get("ok")]
         fallidas = [r for r in resultados if not r.get("ok")]
+        sin_bd = [r for r in resultados if r.get("ok") and not r.get("db_ok", True)]
 
         print(f"Cuentas procesadas: {len(resultados)}")
-        print(f"Cuentas correctas: {len(exitosas)}")
-        print(f"Cuentas con error: {len(fallidas)}")
+        print(f"Scraping correcto: {len(exitosas)}")
+        print(f"Scraping con error: {len(fallidas)}")
+        if conn is not None and sin_bd:
+            print(f"Sin guardar en BD: {len(sin_bd)}")
 
         for resultado in resultados:
-            estado = "OK" if resultado.get("ok") else "ERROR"
+            scrape_ok = resultado.get("ok")
+            db_ok = resultado.get("db_ok", True)
+            if scrape_ok and db_ok:
+                estado = "OK"
+            elif scrape_ok:
+                estado = "OK (sin BD)"
+            else:
+                estado = "ERROR"
             nombre_resultado = resultado.get("nombre", "Sin nombre")
             posts = resultado.get("posts", 0)
 
@@ -976,7 +1419,7 @@ def main(
             if resultado.get("error"):
                 print(f"  Error: {resultado['error']}")
 
-            if resultado.get("mensaje_db") and not resultado.get("ok"):
+            if resultado.get("mensaje_db") and not db_ok:
                 print(f"  BD: {resultado['mensaje_db']}")
 
     finally:

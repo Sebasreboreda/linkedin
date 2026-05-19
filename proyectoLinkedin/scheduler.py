@@ -3,6 +3,7 @@ import subprocess
 import sys
 import traceback
 from datetime import datetime
+
 try:
     from dotenv import load_dotenv
 except ImportError:
@@ -25,27 +26,48 @@ def _cargar_env_manual(env_path: str) -> None:
             os.environ[key] = value
 
 
-def _limpiar_valor_env(valor: str) -> str:
-    limpio = (valor or "").strip()
-    if len(limpio) >= 2 and limpio[0] == limpio[-1] and limpio[0] in {"'", '"'}:
-        return limpio[1:-1].strip()
-    return limpio
+def cargar_env(base_dir: str) -> None:
+    env_path = os.path.join(base_dir, ".env")
+    if load_dotenv:
+        load_dotenv(dotenv_path=env_path, override=True)
+    else:
+        _cargar_env_manual(env_path)
+
+
+def _env_flag(nombre: str, default: bool = False) -> bool:
+    valor = (os.getenv(nombre) or "").strip().lower()
+    if not valor:
+        return default
+    return valor in {"1", "true", "yes", "si", "sí"}
 
 
 def refrescar_login() -> int:
+    if not _env_flag("SCRAPING_RUN_LOGIN", default=False):
+        print(
+            f"[{datetime.now().isoformat(timespec='seconds')}] "
+            "Login omitido (SCRAPING_RUN_LOGIN=0)."
+        )
+        return 0
+
     base_dir = os.path.dirname(os.path.abspath(__file__))
     login_path = os.path.join(base_dir, "login.py")
     if not os.path.exists(login_path):
-        print("No se encontro login.py, se omite refresco de sesion.")
+        print("No se encontró login.py, se omite refresco de sesión.")
         return 0
 
-    print(f"[{datetime.now().isoformat(timespec='seconds')}] Refrescando sesion LinkedIn...")
+    print(
+        f"[{datetime.now().isoformat(timespec='seconds')}] "
+        "Refrescando sesión LinkedIn..."
+    )
     try:
         subprocess.run([sys.executable, login_path], check=True)
-        print(f"[{datetime.now().isoformat(timespec='seconds')}] Login refrescado.")
+        print(
+            f"[{datetime.now().isoformat(timespec='seconds')}] "
+            "Login refrescado."
+        )
         return 0
     except subprocess.CalledProcessError as e:
-        print(f"Error ejecutando login.py (codigo {e.returncode}).")
+        print(f"Error ejecutando login.py (código {e.returncode}).")
         return 1
 
 
@@ -54,17 +76,9 @@ def ejecutar_job() -> int:
     if login_result != 0:
         return login_result
 
-    cuenta = _limpiar_valor_env(os.getenv("SCRAPING_ACCOUNT") or "")
-    if not cuenta:
-        print(
-            "Falta SCRAPING_ACCOUNT en variables de entorno. "
-            "No se puede ejecutar el scraping automatico."
-        )
-        return 1
-
     print(f"[{datetime.now().isoformat(timespec='seconds')}] Iniciando scraping...")
     try:
-        scrapping_general.main(cuenta)
+        scrapping_general.main()
         print(f"[{datetime.now().isoformat(timespec='seconds')}] Scraping completado.")
         return 0
     except Exception:
@@ -75,11 +89,7 @@ def ejecutar_job() -> int:
 
 def main() -> None:
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    env_path = os.path.join(base_dir, ".env")
-    if load_dotenv:
-        load_dotenv(dotenv_path=env_path, override=True)
-    else:
-        _cargar_env_manual(env_path)
+    cargar_env(base_dir)
     raise SystemExit(ejecutar_job())
 
 

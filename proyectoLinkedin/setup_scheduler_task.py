@@ -34,6 +34,17 @@ def leer_hora() -> str:
     return f"{hh:02d}:{mm:02d}"
 
 
+def leer_scraping_days() -> int:
+    raw = (os.getenv("SCRAPING_DAYS") or "1").strip().strip('"').strip("'")
+    try:
+        dias = int(raw)
+    except ValueError as e:
+        raise ValueError("SCRAPING_DAYS debe ser un número entero") from e
+    if dias < 1:
+        raise ValueError("SCRAPING_DAYS debe ser >= 1")
+    return dias
+
+
 def crear_tarea_scheduler() -> None:
     base_dir = os.path.dirname(os.path.abspath(__file__))
     env_path = os.path.join(base_dir, ".env")
@@ -43,15 +54,28 @@ def crear_tarea_scheduler() -> None:
         cargar_env_manual(env_path)
 
     hora = leer_hora()
-    python_exe = os.path.join(base_dir, "venv", "Scripts", "python.exe")
-    scheduler_path = os.path.join(base_dir, "scheduler.py")
+    scraping_days = leer_scraping_days()
 
-    if not os.path.exists(python_exe):
-        raise FileNotFoundError(f"No se encontro python del venv: {python_exe}")
-    if not os.path.exists(scheduler_path):
-        raise FileNotFoundError(f"No se encontro scheduler.py: {scheduler_path}")
+    scheduler_exe = os.path.join(base_dir, "scheduler.exe")
+    scheduler_py = os.path.join(base_dir, "scheduler.py")
+    python_venv = os.path.join(base_dir, "venv", "Scripts", "python.exe")
 
-    tr = f'cmd /c "cd /d \\"{base_dir}\\" && \\"{python_exe}\\" \\"{scheduler_path}\\""'
+    if os.path.exists(scheduler_exe):
+        ejecutable = scheduler_exe
+        tr = f'cmd /c "cd /d \\"{base_dir}\\" && \\"{ejecutable}\\""'
+    elif os.path.exists(scheduler_py):
+        if os.path.exists(python_venv):
+            python_exe = python_venv
+        else:
+            python_exe = sys.executable
+        tr = (
+            f'cmd /c "cd /d \\"{base_dir}\\" && '
+            f'\\"{python_exe}\\" \\"{scheduler_py}\\""'
+        )
+    else:
+        raise FileNotFoundError(
+            f"No se encontró scheduler.exe ni scheduler.py en: {base_dir}"
+        )
     cmd = [
         r"C:\Windows\System32\schtasks.exe",
         "/Create",
@@ -61,12 +85,21 @@ def crear_tarea_scheduler() -> None:
         tr,
         "/SC",
         "DAILY",
+        "/MO",
+        str(scraping_days),
         "/ST",
         hora,
         "/F",
     ]
     subprocess.run(cmd, check=True)
-    print(f"Tarea '{TASK_NAME}' creada/actualizada para ejecutar scheduler.py cada dia a las {hora}.")
+    if scraping_days == 1:
+        frecuencia = "cada día"
+    else:
+        frecuencia = f"cada {scraping_days} días"
+    print(
+        f"Tarea '{TASK_NAME}' creada/actualizada para ejecutar scheduler.py "
+        f"{frecuencia} a las {hora} (SCRAPING_DAYS={scraping_days})."
+    )
 
 
 if __name__ == "__main__":
