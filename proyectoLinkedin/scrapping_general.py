@@ -1,6 +1,5 @@
 import argparse
 import hashlib
-import json
 import logging
 import os
 import re
@@ -98,7 +97,7 @@ def convertir_a_entero(valor: str) -> int:
         mult = 1_000 if m_sufijo.group(2) == "k" else 1_000_000
         return int(base * mult)
 
-    m_mil = re.search(r"(\d+(?:[.,]\d+)?)\s*mil$", texto)
+    m_mil = re.search(r"(\d+(?:[.,]\d+)?)\s*mil\b", texto)
     if m_mil:
         base = float(m_mil.group(1).replace(",", "."))
         return int(base * 1_000)
@@ -349,7 +348,7 @@ def obtener_dias_perfil_inicial() -> int:
 
 
 def obtener_config_ventana_temporal() -> tuple[int, int]:
-    """(perfil_con_datos, perfil_vacio_en_bd)."""
+    """(días perfil en BD, días perfil nuevo sin registrar)."""
     return obtener_scraping_days(), obtener_dias_perfil_inicial()
 
 
@@ -396,48 +395,41 @@ def cuenta_ya_en_lista(cuentas: list[dict], nombre: str) -> bool:
     )
 
 
-def perfil_tiene_publicaciones(
-    conn,
-    perfil_id: int | None,
-    nombre: str,
-) -> bool:
+def perfil_registrado_en_bd(conn, cuenta: dict) -> bool:
+    """True si el perfil ya existe en public.perfiles (aunque no tenga publicaciones)."""
+    if cuenta.get("id") is not None:
+        return True
+    if conn is None:
+        return False
+
+    nombre = cuenta.get("nombre_usuario", "")
+    if not nombre:
+        return False
+
     with conn.cursor() as cur:
-        if perfil_id is not None:
-            cur.execute(
-                """
-                SELECT 1
-                FROM public.publicaciones
-                WHERE perfil_id = %s
-                LIMIT 1
-                """,
-                (perfil_id,),
-            )
-        else:
-            cur.execute(
-                """
-                SELECT 1
-                FROM public.publicaciones p
-                INNER JOIN public.perfiles pf ON pf.id = p.perfil_id
-                WHERE lower(btrim(pf.nombre_usuario)) = lower(btrim(%s))
-                LIMIT 1
-                """,
-                (nombre,),
-            )
+        cur.execute(
+            """
+            SELECT 1
+            FROM public.perfiles
+            WHERE lower(btrim(nombre_usuario)) = lower(btrim(%s))
+            LIMIT 1
+            """,
+            (nombre,),
+        )
         return cur.fetchone() is not None
 
 
 def dias_atras_para_cuenta(conn, cuenta: dict) -> int:
-    """Días según SCRAPING_DAYS / SCRAPING_MONTHS_INITIAL (.env)."""
-    dias_con_datos, dias_perfil_vacio = obtener_config_ventana_temporal()
+    """
+    Perfil en BD → SCRAPING_DAYS (último día, solo seguidores + posts recientes).
+    Perfil nuevo (solo .env) → SCRAPING_MONTHS_INITIAL (carga del último mes).
+    """
+    dias_diario, dias_inicial = obtener_config_ventana_temporal()
     if conn is None:
-        return dias_perfil_vacio
-    if perfil_tiene_publicaciones(
-        conn,
-        cuenta.get("id"),
-        cuenta.get("nombre_usuario", ""),
-    ):
-        return dias_con_datos
-    return dias_perfil_vacio
+        return dias_inicial
+    if perfil_registrado_en_bd(conn, cuenta):
+        return dias_diario
+    return dias_inicial
 
 
 def resolver_cuentas_sin_db(nombre: str | None = None) -> tuple[list[dict], str]:
@@ -461,7 +453,7 @@ def resolver_cuentas_a_scrapear(
     Devuelve (cuentas, origen).
     - BD con perfiles: cuentas de la BD + nuevas del .env no duplicadas.
     - BD vacía: solo cuentas del .env.
-    La ventana temporal (1 vs 30 días) se resuelve por perfil en dias_atras_para_cuenta.
+    La ventana temporal se resuelve en dias_atras_para_cuenta (BD=diario, nuevo=mes inicial).
     """
     if nombre:
         nombre_limpio = limpiar_valor_texto(nombre)
@@ -536,9 +528,7 @@ def guardar_resultados_db(
     Evita duplicados de publicaciones usando:
         UNIQUE (perfil_id, id_publicacion)
 
-    Evita duplicar métricas de perfil en el mismo día:
-        - Si existe una métrica del día actual, la actualiza.
-        - Si no existe, inserta una nueva.
+    Inserta una fila nueva en metricas_perfil en cada ejecución (histórico de seguidores).
     """
     try:
         perfil_id = asegurar_perfil_id(conn, nombre)
@@ -557,41 +547,15 @@ def guardar_resultados_db(
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id
-                FROM public.metricas_perfil
-                WHERE perfil_id = %s
-                  AND fecha_captura >= date_trunc('day', NOW())
-                ORDER BY fecha_captura DESC
-                LIMIT 1
+                INSERT INTO public.metricas_perfil (
+                    perfil_id,
+                    impresiones_totales,
+                    seguidores
+                )
+                VALUES (%s, %s, %s)
                 """,
-                (perfil_id,),
+                (perfil_id, 0, seguidores_int),
             )
-
-            metrica_existente = cur.fetchone()
-
-            if metrica_existente:
-                cur.execute(
-                    """
-                    UPDATE public.metricas_perfil
-                    SET fecha_captura = NOW(),
-                        impresiones_totales = %s,
-                        seguidores = %s
-                    WHERE id = %s
-                    """,
-                    (0, seguidores_int, metrica_existente[0]),
-                )
-            else:
-                cur.execute(
-                    """
-                    INSERT INTO public.metricas_perfil (
-                        perfil_id,
-                        impresiones_totales,
-                        seguidores
-                    )
-                    VALUES (%s, %s, %s)
-                    """,
-                    (perfil_id, 0, seguidores_int),
-                )
 
             for post in posts:
                 try:
@@ -649,7 +613,7 @@ def guardar_resultados_db(
             True,
             f"BD OK '{nombre}' (perfil_id={perfil_id}): "
             f"{guardados} publicaciones guardadas, {omitidos} omitidas, "
-            f"seguidores={seguidores_int}.",
+            f"nueva métrica de seguidores={seguidores_int}.",
         )
 
     except Exception as e:
@@ -776,18 +740,85 @@ def extraer_contenido_desde_tarjeta(tarjeta) -> str:
     return lineas[0][:1200] if lineas else "Sin contenido de texto"
 
 
+def _extraer_numero_seguidores_de_texto(texto: str) -> str | None:
+    if not texto:
+        return None
+
+    texto = normalizar_texto(texto.replace("\u00a0", " "))
+
+    patrones = [
+        r"([\d][\d.,\s]*(?:\s*(?:mil|[km]|m(?:illones)?))?)\s*(?:seguidores|followers)\b",
+        r"\b(?:seguidores|followers)\s*[·•|]?\s*([\d][\d.,\s]*(?:\s*(?:mil|[km]))?)",
+        r"([\d][\d.,\s]*)\s*(?:seguidores|followers)\b",
+    ]
+
+    for patron in patrones:
+        m = re.search(patron, texto, re.IGNORECASE)
+        if m:
+            candidato = normalizar_numero(m.group(1))
+            if candidato and re.search(r"\d", candidato):
+                return candidato
+
+    return None
+
+
 def extraer_seguidores_perfil(page) -> str:
-    texto = page.inner_text("body")
+    """
+    Lee seguidores en la página de perfil. LinkedIn los pinta tarde (JS)
+    y a veces usa '12 mil', '1,2 K', etc.
+    """
+    try:
+        page.wait_for_load_state("domcontentloaded")
+        delay(2)
+    except Exception:
+        pass
 
-    m = re.search(
-        r"(\d[\d.,\s]*)\s*(seguidores|followers)",
-        texto,
-        re.IGNORECASE,
+    selectores = [
+        'main a[href*="follower"]',
+        'section.artdeco-card a[href*="follower"]',
+        'li.text-body-small a[href*="follower"]',
+        ".pv-top-card--list a[href*=\"follower\"]",
+    ]
+
+    for selector in selectores:
+        try:
+            enlaces = page.locator(selector)
+            for i in range(min(enlaces.count(), 3)):
+                bloque = (enlaces.nth(i).inner_text(timeout=2000) or "").strip()
+                padre = ""
+                try:
+                    padre = (
+                        enlaces.nth(i).locator("xpath=ancestor::li[1]").inner_text(
+                            timeout=1500
+                        )
+                        or ""
+                    ).strip()
+                except Exception:
+                    pass
+                for fragmento in (bloque, padre, f"{bloque} seguidores"):
+                    valor = _extraer_numero_seguidores_de_texto(fragmento)
+                    if valor:
+                        return valor
+        except Exception:
+            continue
+
+    try:
+        texto_main = page.locator("main").first.inner_text(timeout=5000)
+    except Exception:
+        texto_main = ""
+
+    valor = _extraer_numero_seguidores_de_texto(texto_main)
+    if valor:
+        return valor
+
+    texto_body = page.inner_text("body", timeout=8000)
+    valor = _extraer_numero_seguidores_de_texto(texto_body)
+    if valor:
+        return valor
+
+    logging.warning(
+        "No se detectaron seguidores en el perfil (DOM aún no listo o perfil sin dato público)."
     )
-
-    if m:
-        return normalizar_numero(m.group(1))
-
     return "No encontrado"
 
 
@@ -1051,7 +1082,7 @@ def extraer_posts_por_antiguedad(
                     }
                 )
 
-                logging.info("Post capturado. Total acumulado: %s", len(posts))
+                logging.debug("Post capturado. Total acumulado: %s", len(posts))
 
             except Exception as e:
                 logging.debug("Error procesando una tarjeta: %s", e)
@@ -1063,53 +1094,6 @@ def extraer_posts_por_antiguedad(
         intentos_scroll += 1
 
     return posts
-
-
-# ============================================================
-# Guardado JSON
-# ============================================================
-
-def guardar_resultados_json(
-    base_dir: str,
-    nombre: str,
-    perfil_url: str,
-    seguidores: str,
-    posts: list,
-    filtro_temporal: str = "ultimo_dia",
-) -> str:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    nombre_limpio = re.sub(r"[^a-zA-Z0-9_-]+", "_", nombre).strip("_") or "cuenta"
-
-    salida_path = os.path.join(
-        base_dir,
-        f"posts_{nombre_limpio}_{timestamp}.json",
-    )
-
-    data = {
-        "cuenta_buscada": nombre,
-        "perfil_url": perfil_url,
-        "seguidores": seguidores,
-        "filtro_temporal": filtro_temporal,
-        "cantidad_obtenida": len(posts),
-        "generado_en": datetime.now().isoformat(timespec="seconds"),
-        "posts": [
-            {
-                "contenido": post["contenido"],
-                "id_publicacion": post["id_publicacion"],
-                "fecha": convertir_fecha_publicacion(post["fecha"]).date().isoformat(),
-                "recomendaciones": post["recomendaciones"],
-                "comentarios": post["comentarios"],
-                "compartidos": post["compartidos"],
-                "envios": post.get("envios", "0"),
-            }
-            for post in posts
-        ],
-    }
-
-    with open(salida_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-    return salida_path
 
 
 # ============================================================
@@ -1147,41 +1131,29 @@ def scrapear_cuenta(page, nombre: str, dias_atras: int = 1) -> dict:
     }
 
 
-def imprimir_resultados_cuenta(resultado: dict) -> None:
+def imprimir_resumen_cuenta(resultado: dict, db_ok: bool | None = None) -> None:
     nombre = resultado["nombre"]
-    seguidores = resultado["seguidores"]
     posts = resultado["posts"]
-
-    print("\n" + "=" * 60)
-    print(f"RESULTADOS DE {nombre.upper()}")
-    print("=" * 60)
-    print(f"Seguidores: {seguidores}")
     dias = resultado.get("dias_atras", 1)
+    ventana = describir_ventana_temporal(dias)
+
+    if db_ok is True:
+        bd = "guardado en BD"
+    elif db_ok is False:
+        bd = "sin BD"
+    else:
+        bd = "BD no disponible"
+
     print(
-        f"Publicaciones encontradas en {describir_ventana_temporal(dias)}: "
-        f"{len(posts)}"
+        f"  {nombre} | Seguidores: {resultado['seguidores']} | "
+        f"Posts: {len(posts)} ({ventana}) | {bd}"
     )
-
-    if not posts:
-        print("No se encontraron publicaciones recientes.")
-        return
-
-    for i, post in enumerate(posts, 1):
-        print(f"\nPost #{i}")
-        print(f"Fecha: {post['fecha']}")
-        print(f"Contenido: {post['contenido']}")
-        print(f"Recomendaciones: {post['recomendaciones']}")
-        print(f"Comentarios: {post['comentarios']}")
-        print(f"Compartidos: {post['compartidos']}")
-        print(f"Envios: {post.get('envios', '0')}")
 
 
 def procesar_cuenta(
     context,
     conn,
     cuenta: dict,
-    base_dir: str,
-    guardar_json: bool = True,
     dias_atras: int = 1,
 ) -> dict:
     nombre = limpiar_valor_texto(cuenta["nombre_usuario"])
@@ -1199,26 +1171,9 @@ def procesar_cuenta(
 
     try:
         resultado = scrapear_cuenta(page, nombre, dias_atras=dias_atras)
-        imprimir_resultados_cuenta(resultado)
-
-        filtro_temporal = f"ultimos_{dias_atras}_dias"
-
-        salida_json = None
-
-        if guardar_json:
-            salida_json = guardar_resultados_json(
-                base_dir=base_dir,
-                nombre=nombre,
-                perfil_url=resultado["perfil_url"],
-                seguidores=resultado["seguidores"],
-                posts=resultado["posts"],
-                filtro_temporal=filtro_temporal,
-            )
-
-            logging.info("JSON guardado en: %s", salida_json)
 
         ok_db = False
-        msg_db = "BD no disponible (scraping guardado solo en JSON/consola)."
+        msg_db = "BD no disponible."
 
         if conn is not None:
             ok_db, msg_db = guardar_resultados_db(
@@ -1233,12 +1188,14 @@ def procesar_cuenta(
             else:
                 logging.error(msg_db)
 
+        imprimir_resumen_cuenta(resultado, db_ok=ok_db if conn is not None else None)
+
         return {
             "ok": True,
             "db_ok": ok_db,
             "nombre": nombre,
+            "seguidores": resultado["seguidores"],
             "posts": len(resultado["posts"]),
-            "json": salida_json,
             "mensaje_db": msg_db,
         }
 
@@ -1276,7 +1233,6 @@ def resolver_headless(cli_headless: bool) -> bool:
 
 def main(
     nombre: str | None = None,
-    guardar_json: bool = True,
     headless: bool = False,
 ) -> None:
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1329,11 +1285,11 @@ def main(
         dias_perfil_vacio = obtener_dias_perfil_inicial()
         print(
             f"SCRAPING_DAYS={scraping_days}: "
-            f"{describir_ventana_temporal(scraping_days)} por perfil con datos"
+            f"{describir_ventana_temporal(scraping_days)} para perfiles ya en la BD"
         )
         print(
             f"SCRAPING_MONTHS_INITIAL={meses_inicial}: "
-            f"{describir_ventana_temporal(dias_perfil_vacio)} si el perfil está vacío"
+            f"{describir_ventana_temporal(dias_perfil_vacio)} solo para perfiles nuevos del .env"
         )
         print("=" * 60)
 
@@ -1357,24 +1313,15 @@ def main(
             context.set_default_navigation_timeout(90000)
 
             try:
+                print("\nProcesando cuentas...")
                 for indice, cuenta in enumerate(cuentas, 1):
                     dias_atras = dias_atras_para_cuenta(conn, cuenta)
-                    ventana = describir_ventana_temporal(dias_atras)
-
-                    print("\n" + "-" * 60)
-                    print(
-                        f"[{indice}/{len(cuentas)}] Procesando cuenta: "
-                        f"{cuenta['nombre_usuario']}"
-                    )
-                    print(f"Ventana para esta cuenta: {ventana}")
-                    print("-" * 60)
+                    print(f"[{indice}/{len(cuentas)}] {cuenta['nombre_usuario']}...", flush=True)
 
                     resultado = procesar_cuenta(
                         context=context,
                         conn=conn,
                         cuenta=cuenta,
-                        base_dir=base_dir,
-                        guardar_json=guardar_json,
                         dias_atras=dias_atras,
                     )
 
@@ -1413,14 +1360,17 @@ def main(
                 estado = "ERROR"
             nombre_resultado = resultado.get("nombre", "Sin nombre")
             posts = resultado.get("posts", 0)
+            seguidores = resultado.get("seguidores", "—")
 
-            print(f"- [{estado}] {nombre_resultado} | Posts: {posts}")
+            print(
+                f"- [{estado}] {nombre_resultado} | "
+                f"Seguidores: {seguidores} | Posts: {posts}"
+            )
 
             if resultado.get("error"):
-                print(f"  Error: {resultado['error']}")
-
-            if resultado.get("mensaje_db") and not db_ok:
-                print(f"  BD: {resultado['mensaje_db']}")
+                print(f"    Error: {resultado['error']}")
+            elif resultado.get("mensaje_db") and not db_ok:
+                print(f"    BD: {resultado['mensaje_db']}")
 
     finally:
         try:
@@ -1442,12 +1392,6 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--no-json",
-        action="store_true",
-        help="No genera archivos JSON locales.",
-    )
-
-    parser.add_argument(
         "--headless",
         action="store_true",
         help="Ejecuta Chromium en modo headless.",
@@ -1457,6 +1401,5 @@ if __name__ == "__main__":
 
     main(
         nombre=args.nombre,
-        guardar_json=not args.no_json,
         headless=args.headless,
     )
