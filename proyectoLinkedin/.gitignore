@@ -1,0 +1,20 @@
+# Secretos
+.env
+.env.release.bak
+.env.paquete.bak
+state.json
+
+# Python (desarrollo)
+venv/
+__pycache__/
+*.py[cod]
+
+# Paquete generado (compartir ZIP / GitHub Releases)
+release/
+LinkedInScraper/
+LinkedInScraper.zip
+build/
+dist/
+
+# IDE
+.vscode/

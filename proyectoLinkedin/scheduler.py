@@ -4,34 +4,9 @@ import sys
 import traceback
 from datetime import datetime
 
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    load_dotenv = None
-
+import app_paths
+import notificaciones
 import scrapping_general
-
-
-def _cargar_env_manual(env_path: str) -> None:
-    if not os.path.exists(env_path):
-        return
-    with open(env_path, "r", encoding="utf-8") as f:
-        for raw_line in f:
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            value = value.strip().strip('"').strip("'")
-            os.environ[key] = value
-
-
-def cargar_env(base_dir: str) -> None:
-    env_path = os.path.join(base_dir, ".env")
-    if load_dotenv:
-        load_dotenv(dotenv_path=env_path, override=True)
-    else:
-        _cargar_env_manual(env_path)
 
 
 def _env_flag(nombre: str, default: bool = False) -> bool:
@@ -49,47 +24,107 @@ def refrescar_login() -> int:
         )
         return 0
 
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    login_path = os.path.join(base_dir, "login.py")
-    if not os.path.exists(login_path):
-        print("No se encontró login.py, se omite refresco de sesión.")
-        return 0
-
+    base_dir = app_paths.get_app_dir()
     print(
         f"[{datetime.now().isoformat(timespec='seconds')}] "
         "Refrescando sesión LinkedIn..."
     )
-    try:
-        subprocess.run([sys.executable, login_path], check=True)
+
+    os.environ["LOGIN_DESDE_SCHEDULER"] = "1"
+
+    detalle_login = None
+    if app_paths.es_frozen():
+        import login
+
+        codigo = login.main()
+        detalle_login = login.ultimo_error_login
+    else:
+        login_path = os.path.join(base_dir, "login.py")
+        if not os.path.exists(login_path):
+            print("No se encontró login.py, se omite refresco de sesión.")
+            return 0
+
+        entorno = os.environ.copy()
+        entorno["LOGIN_DESDE_SCHEDULER"] = "1"
+        resultado = subprocess.run(
+            [sys.executable, "-u", login_path],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=entorno,
+            cwd=base_dir,
+        )
+
+        if resultado.stdout:
+            print(resultado.stdout, end="")
+        if resultado.stderr:
+            print(resultado.stderr, end="", file=sys.stderr)
+        codigo = resultado.returncode
+        partes = [resultado.stderr.strip(), resultado.stdout.strip()]
+        detalle_login = "\n".join(p for p in partes if p) or None
+
+    if codigo == 0:
         print(
             f"[{datetime.now().isoformat(timespec='seconds')}] "
             "Login refrescado."
         )
         return 0
-    except subprocess.CalledProcessError as e:
-        print(f"Error ejecutando login.py (código {e.returncode}).")
-        return 1
+
+    detalle = (detalle_login or "").strip() or f"El login terminó con código {codigo}"
+    print(f"Error de login: {detalle}", file=sys.stderr)
+    notificaciones.agregar_error("Login", detalle)
+    return 1
 
 
 def ejecutar_job() -> int:
-    login_result = refrescar_login()
-    if login_result != 0:
-        return login_result
+    notificaciones.limpiar_errores()
 
-    print(f"[{datetime.now().isoformat(timespec='seconds')}] Iniciando scraping...")
     try:
-        scrapping_general.main()
-        print(f"[{datetime.now().isoformat(timespec='seconds')}] Scraping completado.")
-        return 0
-    except Exception:
-        print(f"[{datetime.now().isoformat(timespec='seconds')}] Error en scraping.")
+        login_result = refrescar_login()
+        if login_result != 0:
+            return 1
+
+        print(f"[{datetime.now().isoformat(timespec='seconds')}] Iniciando scraping...")
+        codigo, mensaje = scrapping_general.main()
+        if codigo == 0:
+            print(
+                f"[{datetime.now().isoformat(timespec='seconds')}] "
+                "Scraping completado."
+            )
+            return 0
+
+        print(
+            f"[{datetime.now().isoformat(timespec='seconds')}] "
+            f"Scraping terminado con código {codigo}.",
+            file=sys.stderr,
+        )
+        if mensaje:
+            print(mensaje, file=sys.stderr)
+        notificaciones.agregar_error("Scraping", mensaje or f"código {codigo}")
+        return codigo
+
+    except Exception as exc:
+        print(
+            f"[{datetime.now().isoformat(timespec='seconds')}] "
+            "Error en scraping.",
+            file=sys.stderr,
+        )
         traceback.print_exc()
+        detalle = "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        )
+        notificaciones.agregar_error("Excepción", detalle)
         return 1
+
+    finally:
+        if notificaciones.tiene_errores():
+            notificaciones.enviar_errores_acumulados()
 
 
 def main() -> None:
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    cargar_env(base_dir)
+    app_paths.verificar_env_usuario()
+    app_paths.cargar_env()
     raise SystemExit(ejecutar_job())
 
 

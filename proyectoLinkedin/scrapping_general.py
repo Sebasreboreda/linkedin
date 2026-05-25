@@ -20,6 +20,8 @@ try:
 except ImportError:
     load_dotenv = None
 
+import app_paths
+
 
 # ============================================================
 # Configuración general
@@ -309,7 +311,10 @@ def asegurar_perfil_id(conn, nombre: str) -> int:
     return perfil_id
 
 
-def cargar_variables_entorno(base_dir: str) -> None:
+def cargar_variables_entorno(base_dir: str | None = None) -> None:
+    if base_dir is None:
+        app_paths.cargar_env()
+        return
     env_path = os.path.join(base_dir, ".env")
     if load_dotenv and os.path.exists(env_path):
         load_dotenv(dotenv_path=env_path, override=True)
@@ -1234,16 +1239,19 @@ def resolver_headless(cli_headless: bool) -> bool:
 def main(
     nombre: str | None = None,
     headless: bool = False,
-) -> None:
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    cargar_variables_entorno(base_dir)
+) -> tuple[int, str]:
+    base_dir = app_paths.get_app_dir()
+    cargar_variables_entorno()
     headless = resolver_headless(headless)
     state_path = os.path.join(base_dir, "state.json")
 
     if not os.path.exists(state_path):
-        print(f"No existe el archivo de sesión: {state_path}")
-        print("Ejecuta primero login.py para generar state.json.")
-        return
+        msg = (
+            f"No existe el archivo de sesión: {state_path}\n"
+            "Ejecuta primero login.py para generar state.json."
+        )
+        print(msg)
+        return 2, msg
 
     conn = None
     esquema_ok = False
@@ -1271,11 +1279,12 @@ def main(
             cuentas, origen = resolver_cuentas_sin_db(nombre=nombre)
 
         if not cuentas:
-            print(
+            msg = (
                 "No hay cuentas para scrapear. "
                 "Añade perfiles en la BD o define SCRAPING_ACCOUNTS / SCRAPING_ACCOUNT en .env"
             )
-            return
+            print(msg)
+            return 2, msg
 
         print("\n" + "=" * 60)
         print(f"Cuentas a scrapear: {len(cuentas)}")
@@ -1296,7 +1305,8 @@ def main(
         resultados = []
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(
+            browser = app_paths.launch_browser(
+                p,
                 headless=headless,
                 slow_mo=_leer_slow_mo(),
             )
@@ -1372,6 +1382,20 @@ def main(
             elif resultado.get("mensaje_db") and not db_ok:
                 print(f"    BD: {resultado['mensaje_db']}")
 
+        if fallidas:
+            lineas = []
+            for r in fallidas:
+                nombre_err = r.get("nombre", "Sin nombre")
+                detalle = r.get("error") or "Error desconocido"
+                lineas.append(f"- {nombre_err}: {detalle}")
+            msg = (
+                f"Scraping con errores ({len(fallidas)}/{len(resultados)} cuentas):\n"
+                + "\n".join(lineas)
+            )
+            return 1, msg
+
+        return 0, ""
+
     finally:
         try:
             conn.close()
@@ -1399,7 +1423,8 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    main(
+    codigo, _ = main(
         nombre=args.nombre,
         headless=args.headless,
     )
+    raise SystemExit(codigo)

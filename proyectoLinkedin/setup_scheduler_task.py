@@ -2,25 +2,10 @@ import os
 import subprocess
 import sys
 
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    load_dotenv = None
+import app_paths
 
 
 TASK_NAME = "LinkedinScraperDaily"
-
-
-def cargar_env_manual(env_path: str) -> None:
-    if not os.path.exists(env_path):
-        return
-    with open(env_path, "r", encoding="utf-8") as f:
-        for raw_line in f:
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            os.environ[key.strip()] = value.strip().strip('"').strip("'")
 
 
 def leer_hora() -> str:
@@ -46,12 +31,8 @@ def leer_scraping_days() -> int:
 
 
 def crear_tarea_scheduler() -> None:
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    env_path = os.path.join(base_dir, ".env")
-    if load_dotenv:
-        load_dotenv(dotenv_path=env_path, override=True)
-    else:
-        cargar_env_manual(env_path)
+    base_dir = app_paths.get_app_dir()
+    app_paths.cargar_env()
 
     hora = leer_hora()
     scraping_days = leer_scraping_days()
@@ -63,6 +44,7 @@ def crear_tarea_scheduler() -> None:
     if os.path.exists(scheduler_exe):
         ejecutable = scheduler_exe
         tr = f'cmd /c "cd /d \\"{base_dir}\\" && \\"{ejecutable}\\""'
+        destino = "scheduler.exe"
     elif os.path.exists(scheduler_py):
         if os.path.exists(python_venv):
             python_exe = python_venv
@@ -72,6 +54,7 @@ def crear_tarea_scheduler() -> None:
             f'cmd /c "cd /d \\"{base_dir}\\" && '
             f'\\"{python_exe}\\" \\"{scheduler_py}\\""'
         )
+        destino = "scheduler.py"
     else:
         raise FileNotFoundError(
             f"No se encontró scheduler.exe ni scheduler.py en: {base_dir}"
@@ -97,9 +80,11 @@ def crear_tarea_scheduler() -> None:
     else:
         frecuencia = f"cada {scraping_days} días"
     print(
-        f"Tarea '{TASK_NAME}' creada/actualizada para ejecutar scheduler.py "
+        f"Tarea '{TASK_NAME}' creada/actualizada para ejecutar {destino} "
         f"{frecuencia} a las {hora} (SCRAPING_DAYS={scraping_days})."
     )
+    print(f"Carpeta de trabajo: {base_dir}")
+    print(f"Configuración: {app_paths.get_env_path()}")
 
 
 if __name__ == "__main__":
