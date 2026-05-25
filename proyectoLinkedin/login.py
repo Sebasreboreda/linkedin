@@ -452,6 +452,7 @@ def _login_automatico(page, email: str, password: str) -> None:
 def main() -> int:
     global ultimo_error_login
     ultimo_error_login = None
+    app_paths.cargar_env()
     email, password = cargar_credenciales()
     if not email or not password:
         env_path = app_paths.get_env_path()

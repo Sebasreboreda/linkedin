@@ -58,9 +58,13 @@ def canal_navegador() -> str | None:
 
 
 def configurar_playwright() -> None:
+    """Solo usa ms-playwright local si NO se usa Chrome/Edge del sistema."""
+    if usar_navegador_sistema():
+        os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+        return
     browsers = _ruta_browsers()
     if os.path.isdir(browsers):
-        os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", browsers)
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = browsers
 
 
 def _instalar_chromium_portable() -> None:
@@ -111,26 +115,42 @@ def asegurar_playwright_browsers() -> None:
     _instalar_chromium_portable()
 
 
+def _canales_a_probar() -> list[str]:
+    preferido = canal_navegador()
+    if not preferido:
+        return []
+    orden = []
+    for c in (preferido, "chrome", "msedge"):
+        if c not in orden:
+            orden.append(c)
+    return orden
+
+
 def launch_browser(playwright, *, headless: bool = False, slow_mo: int | None = None):
     """Abre el navegador (Chrome/Edge del sistema o Chromium portable)."""
-    asegurar_playwright_browsers()
+    cargar_env()
     opts: dict = {"headless": headless}
     if slow_mo is not None:
         opts["slow_mo"] = slow_mo
 
-    canal = canal_navegador()
-    if canal:
-        opts["channel"] = canal
-        try:
-            return playwright.chromium.launch(**opts)
-        except Exception as e:
-            print(
-                f"No se pudo abrir {canal} ({e}). Probando Chromium portable...",
-                file=sys.stderr,
-                flush=True,
-            )
-            opts.pop("channel", None)
+    if usar_navegador_sistema():
+        configurar_playwright()
+        errores: list[str] = []
+        for canal in _canales_a_probar():
+            try:
+                print(f"Abriendo navegador del sistema: {canal}", flush=True)
+                return playwright.chromium.launch(channel=canal, **opts)
+            except Exception as e:
+                errores.append(f"{canal}: {e}")
+        raise SystemExit(
+            "No se pudo abrir Chrome ni Edge en este PC.\n"
+            + "\n".join(errores)
+            + "\n\nComprueba que Google Chrome esté instalado o pon en .env:\n"
+            "  USE_SYSTEM_BROWSER=0\n"
+            "(solo entonces se descargará Chromium portable)."
+        )
 
+    asegurar_playwright_browsers()
     configurar_playwright()
     if not _chromium_instalado():
         _instalar_chromium_portable()
