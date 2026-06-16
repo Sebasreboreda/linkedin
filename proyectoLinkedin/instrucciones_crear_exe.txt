@@ -1,0 +1,8 @@
+# 1) Crear entorno virtual
+python -m venv venv
+.\venv\Scripts\activate
+# 2) Instalar dependencias
+pip install -r requirements.txt
+
+# en la raíz del proyecto
+.\venv\Scripts\python.exe build_release.py
